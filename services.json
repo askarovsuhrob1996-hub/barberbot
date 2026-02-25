@@ -1,0 +1,34 @@
+{
+  "svc_haircut_beard": {
+    "ru":      "Стрижка + борода",
+    "uz":      "Soch + soqol",
+    "ru_c":    "Стрижка + борода",
+    "uz_c":    "Soch + soqol",
+    "mins":    60,
+    "price_uzs": 80000
+  },
+  "svc_beard_color": {
+    "ru":      "Покраска бороды",
+    "uz":      "Soqol bo'yash",
+    "ru_c":    "Покраска бороды",
+    "uz_c":    "Soqol bo'yash",
+    "mins":    30,
+    "price_uzs": 50000
+  },
+  "svc_hair_color": {
+    "ru":      "Покраска волос",
+    "uz":      "Soch bo'yash",
+    "ru_c":    "Покраска волос",
+    "uz_c":    "Soch bo'yash",
+    "mins":    40,
+    "price_uzs": 70000
+  },
+  "svc_highlight": {
+    "ru":      "Мелирование/покраска",
+    "uz":      "Melirovanie/bo'yash",
+    "ru_c":    "Мелирование/покраска",
+    "uz_c":    "Melirovanie/bo'yash",
+    "mins":    90,
+    "price_uzs": 120000
+  }
+}

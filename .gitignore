@@ -1,0 +1,22 @@
+# Credentials & secrets
+.env
+
+# Database & logs (runtime data)
+barber.db
+barber.db-shm
+barber.db-wal
+bot.log
+bot.log.*
+
+# Python virtualenv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Claude Code internal
+.claude/
+
+# macOS
+.DS_Store
