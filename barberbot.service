@@ -1,0 +1,19 @@
+[Unit]
+Description=Barber Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/barberbot
+ExecStart=/home/ubuntu/barberbot/venv/bin/python bot.py
+EnvironmentFile=/home/ubuntu/barberbot/.env
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=barberbot
+
+[Install]
+WantedBy=multi-user.target
