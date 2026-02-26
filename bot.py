@@ -135,6 +135,9 @@ def _init_db() -> None:
                 phone   TEXT,
                 lang    TEXT DEFAULT 'ru'
             );
+            CREATE TABLE IF NOT EXISTS blocked_slots (
+                slot_key TEXT PRIMARY KEY
+            );
         """)
     logger.info("DB initialised: %s", _DB_FILE)
 
@@ -156,6 +159,8 @@ def _load_all() -> None:
             if name:  entry["name"]  = name
             if phone: entry["phone"] = phone
             customer_cache[user_id] = entry
+        for (slot_key,) in conn.execute("SELECT slot_key FROM blocked_slots"):
+            blocked_slots.add(slot_key)
     logger.info(
         "DB loaded: %d bookings, %d pending, %d customers",
         len(appointments), len(pending_bookings), len(customer_cache),
@@ -207,6 +212,23 @@ def _db_save_customer(uid: int) -> None:
             "INSERT OR REPLACE INTO customers (user_id, name, phone, lang) VALUES (?, ?, ?, ?)",
             (uid, c.get("name"), c.get("phone"), c.get("lang", "ru")),
         )
+
+
+def _db_save_blocked(slot_key: str) -> None:
+    try:
+        with sqlite3.connect(_DB_FILE) as conn:
+            conn.execute("INSERT OR IGNORE INTO blocked_slots (slot_key) VALUES (?)", (slot_key,))
+    except Exception as exc:
+        logger.error("DB save_blocked failed for %s: %s", slot_key, exc)
+
+
+def _db_delete_blocked(slot_key: str) -> None:
+    try:
+        with sqlite3.connect(_DB_FILE) as conn:
+            conn.execute("DELETE FROM blocked_slots WHERE slot_key = ?", (slot_key,))
+    except Exception as exc:
+        logger.error("DB delete_blocked failed for %s: %s", slot_key, exc)
+
 
 # Short day labels for the config UI (Russian, barber-facing)
 _DAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -305,9 +327,8 @@ STRINGS: dict[str, dict[str, str]] = {
             "  ⏱ Длительность:  ~{dur} мин.\n"
             "  👤 Имя:           {name}\n"
             "  📞 Телефон:       {phone}\n"
-            "  ✂️ Услуги:        {svcs}\n"
-            "{price}"
-            "\nВсё верно?"
+            "  ✂️ Услуги:        {svcs}\n\n"
+            "Всё верно?"
         ),
         "btn_confirm":          "✅ Записаться",
         "btn_cancel":           "❌ Отмена",
@@ -325,9 +346,8 @@ STRINGS: dict[str, dict[str, str]] = {
             "🎉 <b>Запись подтверждена!</b>\n\n"
             "📅 {date}\n"
             "🕐 {time}\n"
-            "✂️ {svcs}\n"
-            "{price}"
-            "\nЖдём вас! Если планы изменятся — напишите нам заранее.\n"
+            "✂️ {svcs}\n\n"
+            "Ждём вас! Если планы изменятся — напишите нам заранее.\n"
             "Для новой записи: /start"
         ),
         "rejected":             (
@@ -348,7 +368,13 @@ STRINGS: dict[str, dict[str, str]] = {
             "Посмотрите её командой /mybooking — там можно перенести или отменить."
         ),
         "booking_cancel":       "Запись отменена. Будем рады видеть вас снова — /start",
-        "unexpected":           "Не совсем понял 🤔 Следуйте подсказкам или нажмите /cancel.",
+        "flow_cancelled":       "✅ Оформление записи прервано.",
+        "cancel_no_flow":       (
+            "ℹ️ У вас нет активного оформления записи.\n\n"
+            "Чтобы <b>отменить существующую запись</b> — используйте /mybooking.\n"
+            "Чтобы <b>записаться</b> — /start"
+        ),
+        "unexpected":           "Не совсем понял 🤔 Следуйте подсказкам.",
         # ── settings ───────────────────────────────────────────────────────────
         "settings":             "⚙️ <b>Настройки</b>\n\nВыберите язык:",
         "settings_mid_conv":    (
@@ -463,9 +489,8 @@ STRINGS: dict[str, dict[str, str]] = {
             "  ⏱ Davomiyligi:  ~{dur} daqiqa\n"
             "  👤 Ism:          {name}\n"
             "  📞 Telefon:      {phone}\n"
-            "  ✂️ Xizmat:       {svcs}\n"
-            "{price}"
-            "\nHammasi to'g'rimi?"
+            "  ✂️ Xizmat:       {svcs}\n\n"
+            "Hammasi to'g'rimi?"
         ),
         "btn_confirm":          "✅ Yozilish",
         "btn_cancel":           "❌ Bekor",
@@ -483,9 +508,8 @@ STRINGS: dict[str, dict[str, str]] = {
             "🎉 <b>Yozilishingiz tasdiqlandi!</b>\n\n"
             "📅 {date}\n"
             "🕐 {time}\n"
-            "✂️ {svcs}\n"
-            "{price}"
-            "\nSizni kutamiz! Reja o'zgarsa — oldindan xabar bering.\n"
+            "✂️ {svcs}\n\n"
+            "Sizni kutamiz! Reja o'zgarsa — oldindan xabar bering.\n"
             "Yangi yozilish uchun: /start"
         ),
         "rejected":             (
@@ -506,7 +530,13 @@ STRINGS: dict[str, dict[str, str]] = {
             "/mybooking buyrug'i bilan ko'ring — u yerda ko'chirish yoki bekor qilish mumkin."
         ),
         "booking_cancel":       "Yozilish bekor qilindi. Yana ko'rishguncha — /start",
-        "unexpected":           "Tushunmadim 🤔 Ko'rsatmalarga amal qiling yoki /cancel bosing.",
+        "flow_cancelled":       "✅ Yozilish jarayoni to'xtatildi.",
+        "cancel_no_flow":       (
+            "ℹ️ Faol yozilish jarayoni yo'q.\n\n"
+            "<b>Mavjud yozilishni bekor qilish</b> uchun — /mybooking.\n"
+            "<b>Yozilish</b> uchun — /start"
+        ),
+        "unexpected":           "Tushunmadim 🤔 Ko'rsatmalarga amal qiling.",
         # ── settings ───────────────────────────────────────────────────────────
         "settings":             "⚙️ <b>Sozlamalar</b>\n\nTilni tanlang:",
         "settings_mid_conv":    (
@@ -620,6 +650,7 @@ pending_bookings: dict[int, dict[str, Any]] = {}   # booking_id → booking
 _pending_counter = 0
 
 customer_cache: dict[int, dict[str, str]] = {}     # user_id → {name, phone, lang}
+blocked_slots:  set[str] = set()                   # "YYYY-MM-DD HH:MM" — barber-blocked slots
 
 
 def _next_id() -> int:
@@ -629,7 +660,7 @@ def _next_id() -> int:
 
 
 def _all_taken_slots(exclude_slot_key: str | None = None) -> set[str]:
-    taken: set[str] = set()
+    taken: set[str] = set(blocked_slots)   # barber-blocked slots always taken
     for slot_key, bk in appointments.items():
         if slot_key == exclude_slot_key:
             continue
@@ -843,11 +874,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text(
-        tx(update.effective_user.id, "booking_cancel"),
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    uid = update.effective_user.id
+    if context.user_data:
+        # Inside an active booking flow — exit it
+        context.user_data.clear()
+        await update.message.reply_text(
+            tx(uid, "flow_cancelled"),
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        # Not in a flow — guide to /mybooking
+        await update.message.reply_text(
+            tx(uid, "cancel_no_flow"),
+            reply_markup=ReplyKeyboardRemove(),
+        )
     return ConversationHandler.END
 
 
@@ -1090,15 +1130,12 @@ async def cb_service_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["duration_mins"]  = total_mins
         context.user_data["time_range"]     = time_range
 
-        # Client sees service names WITHOUT prices
-        svc_text   = ", ".join(_svc_client_label(s, lang) for s in selected)
-        price_line = _price_line(_calc_total_price(list(selected)), lang)
-        price_str  = f"  {price_line}\n" if price_line else ""
+        svc_text = ", ".join(_svc_client_label(s, lang) for s in selected)
 
         await query.edit_message_text(
             tx(uid, "confirm_text",
                date=_fmt_date(d, lang), time=time_range,
-               dur=total_mins, name=name, phone=phone, svcs=svc_text, price=price_str),
+               dur=total_mins, name=name, phone=phone, svcs=svc_text),
             parse_mode="HTML",
             reply_markup=_confirm_keyboard(lang),
         )
@@ -1233,15 +1270,10 @@ async def cb_barber_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text(
             query.message.text + "\n\n✅ <b>Одобрено</b>", parse_mode="HTML"
         )
-        total_price = _calc_total_price(booking["services"])
-        price_line  = _price_line(total_price, cust_lang)
-        price_str   = f"  {price_line}\n" if price_line else ""
         cust_text = STRINGS[cust_lang]["approved"].format(
             date=booking["date_str"],
             time=booking["time_range"],
-            # Client sees service names WITHOUT prices
             svcs=", ".join(_svc_client_label(s, cust_lang) for s in booking["services"]),
-            price=price_str,
         )
     else:
         logger.info("Rejected #%d %s", bid, booking["slot_key"])
@@ -1370,11 +1402,21 @@ def _all_upcoming_bookings() -> list[tuple[str, dict]]:
 
 def _build_manage_list() -> tuple[str, InlineKeyboardMarkup]:
     bookings = _all_upcoming_bookings()
-    if not bookings:
+    now = datetime.now(tz=TZ)
+    upcoming_blocked = sorted(
+        s for s in blocked_slots
+        if datetime(*map(int, s.replace(" ", "-").replace(":", "-").split("-")), tzinfo=TZ) >= now
+    )
+
+    if not bookings and not upcoming_blocked:
         return (
             "📋 <b>Нет предстоящих записей.</b>",
-            InlineKeyboardMarkup([[InlineKeyboardButton("← Закрыть", callback_data="bclose")]]),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚫 Заблокировать слот", callback_data="bblock")],
+                [InlineKeyboardButton("← Закрыть",            callback_data="bclose")],
+            ]),
         )
+
     lines = ["📋 <b>Предстоящие записи — выберите:</b>\n"]
     buttons = []
     for slot_key, bk in bookings:
@@ -1383,7 +1425,18 @@ def _build_manage_list() -> tuple[str, InlineKeyboardMarkup]:
         label = f"{_fmt_date_short(d)} {tr} — {bk['name']}"
         enc = slot_key.replace(" ", "_", 1)
         buttons.append([InlineKeyboardButton(label, callback_data=f"bselect_{enc}")])
-    buttons.append([InlineKeyboardButton("← Закрыть", callback_data="bclose")])
+
+    if upcoming_blocked:
+        lines.append("\n🚫 <b>Заблокированные слоты:</b>")
+        for slot_key in upcoming_blocked:
+            d = date.fromisoformat(slot_key.split(" ")[0])
+            t = slot_key.split(" ")[1]
+            enc = slot_key.replace(" ", "_", 1)
+            label = f"🔓 {_fmt_date_short(d)} {t}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"bblkunblock_{enc}")])
+
+    buttons.append([InlineKeyboardButton("🚫 Заблокировать слот", callback_data="bblock")])
+    buttons.append([InlineKeyboardButton("← Закрыть",            callback_data="bclose")])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
@@ -2183,6 +2236,106 @@ async def cb_ur_back_date(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+# ─────────────────────────── Barber: block/unblock slots ─────────────────────
+
+async def cb_bblock_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show date picker to choose a slot to block."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != BARBER_CHAT_ID:
+        return
+    await query.edit_message_text(
+        "🚫 <b>Заблокировать слот</b>\n\nВыберите дату:",
+        parse_mode="HTML",
+        reply_markup=_date_keyboard("ru", date_prefix="bblkdate", cancel_data="bmanage"),
+    )
+
+
+async def cb_bblock_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Date chosen — show time picker."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != BARBER_CHAT_ID:
+        return
+    d = date.fromisoformat(query.data[len("bblkdate_"):])
+    context.user_data["bblock_date"] = d
+    slots = _time_keyboard(d, "ru", time_prefix="bblktime", back_data="bblock", cancel_data="bmanage")
+    if not slots:
+        await query.edit_message_text("Все слоты на эту дату уже заняты или заблокированы.")
+        return
+    await query.edit_message_text(
+        f"🚫 Выберите время для блокировки\n📅 {_fmt_date(d, 'ru')}:",
+        parse_mode="HTML",
+        reply_markup=slots,
+    )
+
+
+async def cb_bblock_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Time chosen — ask confirmation."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != BARBER_CHAT_ID:
+        return
+    t = query.data[len("bblktime_"):]
+    d = context.user_data.get("bblock_date")
+    if not d:
+        await query.edit_message_text("Ошибка: дата не выбрана.")
+        return
+    context.user_data["bblock_time"] = t
+    slot_key = f"{d.isoformat()} {t}"
+    await query.edit_message_text(
+        f"🚫 Заблокировать <b>{_fmt_date(d, 'ru')} {t}</b>?\n\n"
+        f"Клиенты не смогут записаться на это время.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Заблокировать", callback_data="bblkconfirm")],
+            [InlineKeyboardButton("← Назад",          callback_data=f"bblkdate_{d.isoformat()}")],
+        ]),
+    )
+
+
+async def cb_bblock_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm block — save to memory and DB."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != BARBER_CHAT_ID:
+        return
+    d = context.user_data.pop("bblock_date", None)
+    t = context.user_data.pop("bblock_time", None)
+    if not d or not t:
+        await query.edit_message_text("Ошибка: данные не найдены.")
+        return
+    slot_key = f"{d.isoformat()} {t}"
+    blocked_slots.add(slot_key)
+    _db_save_blocked(slot_key)
+    logger.info("Barber blocked slot: %s", slot_key)
+    text, kb = _build_manage_list()
+    await query.edit_message_text(
+        f"✅ Слот <b>{_fmt_date(d, 'ru')} {t}</b> заблокирован.\n\n" + text,
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+async def cb_bblock_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unblock a previously blocked slot."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != BARBER_CHAT_ID:
+        return
+    encoded  = query.data[len("bblkunblock_"):]
+    slot_key = encoded.replace("_", " ", 1)
+    blocked_slots.discard(slot_key)
+    _db_delete_blocked(slot_key)
+    logger.info("Barber unblocked slot: %s", slot_key)
+    text, kb = _build_manage_list()
+    await query.edit_message_text(
+        f"🔓 Слот <b>{slot_key}</b> разблокирован.\n\n" + text,
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
 # ─────────────────────────── Fallback ────────────────────────────────────────
 
 async def handle_unexpected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2306,6 +2459,12 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(cb_ur_confirm,    pattern=r"^urconfirm$"))
     app.add_handler(CallbackQueryHandler(cb_ur_back,       pattern=r"^urback$"))
     app.add_handler(CallbackQueryHandler(cb_ur_back_date,  pattern=r"^urback_date$"))
+    # Block/unblock time slots (barber)
+    app.add_handler(CallbackQueryHandler(cb_bblock_start,   pattern=r"^bblock$"))
+    app.add_handler(CallbackQueryHandler(cb_bblock_date,    pattern=r"^bblkdate_\d{4}-\d{2}-\d{2}$"))
+    app.add_handler(CallbackQueryHandler(cb_bblock_time,    pattern=r"^bblktime_\d{2}:\d{2}$"))
+    app.add_handler(CallbackQueryHandler(cb_bblock_confirm, pattern=r"^bblkconfirm$"))
+    app.add_handler(CallbackQueryHandler(cb_bblock_unblock, pattern=r"^bblkunblock_"))
     # "cancel" inline button from an expired conversation keyboard
     app.add_handler(CallbackQueryHandler(_cancel_cb, pattern=r"^cancel$"))
     app.add_handler(CallbackQueryHandler(cb_config, pattern=r"^cfg_"))
