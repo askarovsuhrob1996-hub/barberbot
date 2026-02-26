@@ -368,12 +368,12 @@ STRINGS: dict[str, dict[str, str]] = {
             "Посмотрите её командой /mybooking — там можно перенести или отменить."
         ),
         "booking_cancel":       "Запись отменена. Будем рады видеть вас снова — /start",
-        "flow_cancelled":       "✅ Оформление записи прервано.",
-        "cancel_no_flow":       (
-            "ℹ️ У вас нет активного оформления записи.\n\n"
-            "Чтобы <b>отменить существующую запись</b> — используйте /mybooking.\n"
-            "Чтобы <b>записаться</b> — /start"
+        "flow_cancelled":       (
+            "Оформление записи отменено. Данные не сохранены.\n\n"
+            "Записаться снова — /start\n"
+            "Ваши записи — /mybooking"
         ),
+        "cancel_no_flow":       None,  # unused: /cancel redirects to cmd_mybooking
         "unexpected":           "Не совсем понял 🤔 Следуйте подсказкам.",
         # ── settings ───────────────────────────────────────────────────────────
         "settings":             "⚙️ <b>Настройки</b>\n\nВыберите язык:",
@@ -530,12 +530,12 @@ STRINGS: dict[str, dict[str, str]] = {
             "/mybooking buyrug'i bilan ko'ring — u yerda ko'chirish yoki bekor qilish mumkin."
         ),
         "booking_cancel":       "Yozilish bekor qilindi. Yana ko'rishguncha — /start",
-        "flow_cancelled":       "✅ Yozilish jarayoni to'xtatildi.",
-        "cancel_no_flow":       (
-            "ℹ️ Faol yozilish jarayoni yo'q.\n\n"
-            "<b>Mavjud yozilishni bekor qilish</b> uchun — /mybooking.\n"
-            "<b>Yozilish</b> uchun — /start"
+        "flow_cancelled":       (
+            "Yozilish jarayoni bekor qilindi. Ma'lumotlar saqlanmadi.\n\n"
+            "Qaytadan yozilish — /start\n"
+            "Yozilishlarim — /mybooking"
         ),
+        "cancel_no_flow":       None,  # unused: /cancel redirects to cmd_mybooking
         "unexpected":           "Tushunmadim 🤔 Ko'rsatmalarga amal qiling.",
         # ── settings ───────────────────────────────────────────────────────────
         "settings":             "⚙️ <b>Sozlamalar</b>\n\nTilni tanlang:",
@@ -881,13 +881,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
             tx(uid, "flow_cancelled"),
             reply_markup=ReplyKeyboardRemove(),
+            parse_mode="HTML",
         )
     else:
-        # Not in a flow — guide to /mybooking
-        await update.message.reply_text(
-            tx(uid, "cancel_no_flow"),
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        # Not in a flow — show mybooking directly
+        await cmd_mybooking(update, context)
     return ConversationHandler.END
 
 
