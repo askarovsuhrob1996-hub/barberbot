@@ -14,14 +14,27 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
+          # --- Set up SSH key ---
           mkdir -p ~/.ssh
-          echo "$DEPLOY_KEY" | base64 -d > ~/.ssh/deploy_key
+          chmod 700 ~/.ssh
+
+          # Write the key using printf to preserve exact content.
+          # The trailing newline is critical for OpenSSH key parsing.
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+
+          # Validate the key is parseable before attempting SSH
+          ssh-keygen -l -f ~/.ssh/deploy_key
+
+          # Pre-populate known_hosts to avoid MITM prompt
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # --- Deploy ---
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /home/ubuntu/barberbot
             git pull origin main
             ./venv/bin/pip install -q -r requirements.txt
             sudo systemctl restart barberbot
-            echo "Deploy done"
+            echo "Deploy complete"
           '
