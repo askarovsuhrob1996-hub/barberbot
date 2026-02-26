@@ -827,7 +827,10 @@ def _confirm_keyboard(lang: str) -> InlineKeyboardMarkup:
 
 def _phone_keyboard(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(STRINGS[lang]["share_phone"], request_contact=True)]],
+        [
+            [KeyboardButton(STRINGS[lang]["share_phone"], request_contact=True)],
+            [KeyboardButton(STRINGS[lang]["btn_cancel"])],
+        ],
         resize_keyboard=True, one_time_keyboard=True,
     )
 
@@ -1022,7 +1025,13 @@ async def cb_time_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return STATE_SERVICES
 
-    await query.edit_message_text(tx(uid, "enter_name", time=t), parse_mode="HTML")
+    await query.edit_message_text(
+        tx(uid, "enter_name", time=t),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(STRINGS[lang]["btn_cancel"], callback_data="cancel"),
+        ]]),
+    )
     return STATE_NAME
 
 
@@ -1058,9 +1067,19 @@ async def handle_phone_contact(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_phone_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid   = update.effective_user.id
     phone = update.message.text.strip()
+    lang  = _lang(uid)
+    # Cancel button pressed on ReplyKeyboard
+    if phone in (STRINGS["ru"]["btn_cancel"], STRINGS["uz"]["btn_cancel"]):
+        context.user_data.clear()
+        await update.message.reply_text(
+            tx(uid, "flow_cancelled"),
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
     if len("".join(c for c in phone if c.isdigit())) < 7:
         await update.message.reply_text(
-            tx(uid, "invalid_phone"), reply_markup=_phone_keyboard(_lang(uid))
+            tx(uid, "invalid_phone"), reply_markup=_phone_keyboard(lang)
         )
         return STATE_PHONE
     return await _after_phone(update, context, phone)
@@ -2371,7 +2390,6 @@ async def _post_init(app: Application) -> None:
         BotCommand("start",      "📅 Book / Записаться / Yozilish"),
         BotCommand("mybooking",  "📋 My booking / Моя запись / Mening yozilishim"),
         BotCommand("settings",   "⚙️ Language / Язык / Til"),
-        BotCommand("cancel",     "❌ Cancel flow / Отменить / Bekor"),
     ]
     barber_commands = customer_commands + [
         BotCommand("bookings", "📋 Today's schedule / Сегодня"),
