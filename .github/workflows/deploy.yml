@@ -9,15 +9,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} '
             set -e
             cd /home/ubuntu/barberbot
             git pull origin main
             ./venv/bin/pip install -q -r requirements.txt
             sudo systemctl restart barberbot
-            echo "✅ Deploy done: $(git log -1 --format='%h %s')"
+            echo Deploy done
+          '
