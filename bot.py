@@ -1506,54 +1506,84 @@ async def cb_bclose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─────────────────────────── Schedule builder ────────────────────────────────
 
-def _build_today_schedule() -> tuple[str, InlineKeyboardMarkup | None]:
-    today     = datetime.now(tz=TZ).date()
-    iso_today = today.isoformat()
-    confirmed = {k: v for k, v in appointments.items()      if k.startswith(iso_today)}
-    pending   = {i: b for i, b in pending_bookings.items()  if b["slot_key"].startswith(iso_today)}
+def _build_day_schedule(d: date) -> tuple[str, InlineKeyboardMarkup]:
+    today    = datetime.now(tz=TZ).date()
+    max_date = today + timedelta(days=DAYS_AHEAD)
+    iso      = d.isoformat()
+
+    confirmed = {k: v for k, v in appointments.items()     if k.startswith(iso)}
+    pending   = {i: b for i, b in pending_bookings.items() if b["slot_key"].startswith(iso)}
+
+    if d == today:
+        header = f"📅 <b>Сегодня — {_fmt_date(d)}</b>"
+    else:
+        header = f"📅 <b>{_fmt_date(d)}</b>"
 
     if not confirmed and not pending:
-        return "📅 <b>На сегодня записей нет.</b>", None
+        lines = [header, "\nЗаписей нет."]
+    else:
+        lines = [header + "\n"]
+        entries = []
 
-    lines   = [f"📅 <b>Расписание на сегодня — {_fmt_date(today)}</b>\n"]
-    buttons: list[list[InlineKeyboardButton]] = []
-    entries = []
+        for sk, bk in confirmed.items():
+            t  = sk.split(" ")[1]
+            tr = bk.get("time_range", t)
+            entries.append((t, "confirmed", sk, bk["name"], bk["phone"],
+                            [_svc_label(s, "ru") for s in bk["services"]], tr))
 
-    for sk, bk in confirmed.items():
-        t  = sk.split(" ")[1]
-        tr = bk.get("time_range", t)
-        entries.append((t, "confirmed", sk, bk["name"], bk["phone"],
-                        [_svc_label(s, "ru") for s in bk["services"]], tr))
+        for _, bk in pending.items():
+            t  = bk["slot_key"].split(" ")[1]
+            tr = bk.get("time_range", t)
+            entries.append((t, "pending", None, bk["name"], bk["phone"],
+                            [_svc_label(s, "ru") for s in bk["services"]], tr))
 
-    for _, bk in pending.items():
-        t  = bk["slot_key"].split(" ")[1]
-        tr = bk.get("time_range", t)
-        entries.append((t, "pending", None, bk["name"], bk["phone"],
-                        [_svc_label(s, "ru") for s in bk["services"]], tr))
+        entries.sort(key=lambda x: x[0])
 
-    entries.sort(key=lambda x: x[0])
+        for t, status, sk, name, phone, svc, tr in entries:
+            icon = "✅" if status == "confirmed" else "⏳"
+            lines.append(
+                f"{icon} <code>{tr}</code>  <b>{name}</b>  <i>({phone})</i>\n"
+                f"    {', '.join(svc)}"
+            )
+        lines.append("\n<i>✅ подтверждено  |  ⏳ ожидает одобрения</i>")
 
-    for t, status, sk, name, phone, svc, tr in entries:
-        icon = "✅" if status == "confirmed" else "⏳"
-        lines.append(
-            f"{icon} <code>{tr}</code>  <b>{name}</b>  <i>({phone})</i>\n"
-            f"    {', '.join(svc)}"
-        )
+    # Navigation row
+    prev_d = d - timedelta(days=1)
+    next_d = d + timedelta(days=1)
+    nav: list[InlineKeyboardButton] = []
+    if prev_d >= today:
+        nav.append(InlineKeyboardButton("← Назад", callback_data=f"bday_{prev_d.isoformat()}"))
+    else:
+        nav.append(InlineKeyboardButton(" ", callback_data="noop"))
+    if d != today:
+        nav.append(InlineKeyboardButton("📌 Сегодня", callback_data=f"bday_{today.isoformat()}"))
+    if next_d <= max_date:
+        nav.append(InlineKeyboardButton("Вперёд →", callback_data=f"bday_{next_d.isoformat()}"))
 
-    lines.append("\n<i>✅ подтверждено  |  ⏳ ожидает одобрения</i>")
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📋 Управление записями", callback_data="bmanage")
-    ]])
-    return "\n".join(lines), kb
+    rows: list[list[InlineKeyboardButton]] = []
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("📋 Управление записями", callback_data="bmanage")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 # ─────────────────────────── /bookings ───────────────────────────────────────
+
+async def cb_bday_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != BARBER_CHAT_ID:
+        return
+    d = date.fromisoformat(query.data[len("bday_"):])
+    text, kb = _build_day_schedule(d)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
 
 async def cmd_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != BARBER_CHAT_ID:
         await update.message.reply_text("Эта команда только для мастера.")
         return
-    text, kb = _build_today_schedule()
+    text, kb = _build_day_schedule(datetime.now(tz=TZ).date())
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -2456,6 +2486,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(cb_setlang,
                                           pattern=r"^setlang_(ru|uz)$"))
 
+    app.add_handler(CallbackQueryHandler(cb_bday_nav, pattern=r"^bday_\d{4}-\d{2}-\d{2}$"))
     app.add_handler(CommandHandler("bookings",  cmd_bookings))
     app.add_handler(CommandHandler("week",      cmd_week))
     app.add_handler(CommandHandler("settings",  cmd_settings))
