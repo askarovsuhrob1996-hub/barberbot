@@ -26,6 +26,7 @@ import logging
 import logging.handlers
 import math
 import os
+import re
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -426,6 +427,9 @@ STRINGS: dict[str, dict[str, str]] = {
             "Как только мастер подтвердит — вы получите уведомление. 😊"
         ),
         "same_slot":              "Это то же время, что и сейчас. Выберите другое.",
+        # ── main menu buttons ──────────────────────────────────────────────────
+        "menu_book": "✂️ Записаться",
+        "menu_lang": "🌐 Выбрать язык",
     },
     "uz": {
         # ── language ──────────────────────────────────────────────────────────
@@ -588,8 +592,26 @@ STRINGS: dict[str, dict[str, str]] = {
             "Usta tasdiqlashi bilanoq sizga xabar beramiz. 😊"
         ),
         "same_slot":              "Bu hozirgi vaqt bilan bir xil. Boshqa tanlang.",
+        # ── main menu buttons ──────────────────────────────────────────────────
+        "menu_book": "✂️ Yozilish",
+        "menu_lang": "🌐 Tilni tanlash",
     },
 }
+
+
+# ─────────────────────────── Main menu keyboard ───────────────────────────────
+
+# All possible texts that the persistent menu buttons can send.
+MENU_BOOK_TEXTS = {STRINGS["ru"]["menu_book"], STRINGS["uz"]["menu_book"]}
+MENU_LANG_TEXTS = {STRINGS["ru"]["menu_lang"], STRINGS["uz"]["menu_lang"]}
+
+
+def _main_menu_kb(lang: str) -> ReplyKeyboardMarkup:
+    """Persistent two-button keyboard shown below the message input."""
+    return ReplyKeyboardMarkup(
+        [[STRINGS[lang]["menu_book"]], [STRINGS[lang]["menu_lang"]]],
+        resize_keyboard=True,
+    )
 
 
 # ─────────────────────────── Services catalogue ───────────────────────────────
@@ -876,6 +898,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return STATE_DATE
 
 
+async def cmd_menu_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'Choose language' persistent-menu button (outside conversation)."""
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        STRINGS[_lang(uid)]["settings"],
+        parse_mode="HTML",
+        reply_markup=_lang_keyboard("setlang_"),
+    )
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     if context.user_data:
@@ -883,7 +915,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data.clear()
         await update.message.reply_text(
             tx(uid, "flow_cancelled"),
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=_main_menu_kb(_lang(uid)),
             parse_mode="HTML",
         )
     else:
@@ -935,6 +967,7 @@ async def cb_setlang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _db_save_customer(uid)
     key  = f"lang_changed_{lang}"
     await query.edit_message_text(STRINGS[lang].get(key, "✅"))
+    await query.message.reply_text("👇", reply_markup=_main_menu_kb(lang))
 
 
 # ─────────────────────────── STATE_LANG ──────────────────────────────────────
@@ -1302,22 +1335,10 @@ async def cb_barber_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     try:
-        if action == "approve":
-            await query.get_bot().send_message(
-                chat_id=booking["chat_id"], text=cust_text, parse_mode="HTML"
-            )
-        else:
-            # On reject: offer a quick "Book again" button so user doesn't have to /start manually
-            rebook_kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "🔄 Записаться снова" if cust_lang == "ru" else "🔄 Qayta yozilish",
-                    url=f"https://t.me/{(await query.get_bot().get_me()).username}?start=1",
-                )
-            ]])
-            await query.get_bot().send_message(
-                chat_id=booking["chat_id"], text=cust_text,
-                parse_mode="HTML", reply_markup=rebook_kb,
-            )
+        await query.get_bot().send_message(
+            chat_id=booking["chat_id"], text=cust_text,
+            parse_mode="HTML", reply_markup=_main_menu_kb(cust_lang),
+        )
     except Exception as exc:
         logger.error("Customer notify failed: %s", exc)
 
@@ -2439,8 +2460,18 @@ async def _post_init(app: Application) -> None:
 def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
+    _book_filter = filters.TEXT & filters.Regex(
+        "^(" + "|".join(re.escape(t) for t in MENU_BOOK_TEXTS) + ")$"
+    )
+    _lang_filter = filters.TEXT & filters.Regex(
+        "^(" + "|".join(re.escape(t) for t in MENU_LANG_TEXTS) + ")$"
+    )
+
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            MessageHandler(_book_filter, cmd_start),
+        ],
         states={
             # Patterns are intentionally narrow so that unrelated callbacks
             # (e.g. setlang_) fall through and are handled by global handlers.
@@ -2496,6 +2527,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("mybooking", cmd_mybooking))
     # /cancel also works outside an active booking conversation
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
+    # Persistent menu "language" button (outside conversation)
+    app.add_handler(MessageHandler(_lang_filter, cmd_menu_lang))
     app.add_handler(CallbackQueryHandler(cb_user_cancel,
                                           pattern=r"^ucancel_\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$"))
     # Reschedule flow
