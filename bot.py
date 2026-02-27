@@ -430,6 +430,16 @@ STRINGS: dict[str, dict[str, str]] = {
         # ── main menu buttons ──────────────────────────────────────────────────
         "menu_book": "✂️ Записаться",
         "menu_lang": "🌐 Выбрать язык",
+        # ── help ───────────────────────────────────────────────────────────────
+        "help": (
+            "👋 Привет! Я бот барбершопа.\n\n"
+            "Что умею:\n"
+            "✂️ <b>Записаться</b> — выбрать дату, время и услуги\n"
+            "📋 /mybooking — посмотреть, перенести или отменить запись\n"
+            "🌐 /settings — сменить язык (O'zbek / Русский)\n"
+            "⏰ Напомню за 30 минут до визита\n\n"
+            "Нажмите <b>✂️ Записаться</b> или /start чтобы начать 👇"
+        ),
     },
     "uz": {
         # ── language ──────────────────────────────────────────────────────────
@@ -595,6 +605,16 @@ STRINGS: dict[str, dict[str, str]] = {
         # ── main menu buttons ──────────────────────────────────────────────────
         "menu_book": "✂️ Yozilish",
         "menu_lang": "🌐 Tilni tanlash",
+        # ── help ───────────────────────────────────────────────────────────────
+        "help": (
+            "👋 Salom! Men sartaroshxona botiman.\n\n"
+            "Nima qila olaman:\n"
+            "✂️ <b>Yozilish</b> — sana, vaqt va xizmat tanlash\n"
+            "📋 /mybooking — yozilishni ko'rish, ko'chirish yoki bekor qilish\n"
+            "🌐 /settings — tilni o'zgartirish (O'zbek / Русский)\n"
+            "⏰ Tashrif oldidan 30 daqiqa oldin eslataman\n\n"
+            "✂️ <b>Yozilish</b> tugmasini bosing yoki /start yuboring 👇"
+        ),
     },
 }
 
@@ -885,6 +905,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if "lang" not in customer_cache.get(uid, {}):
         await update.message.reply_text(
+            STRINGS["ru"]["help"] + "\n\n——\n\n" + STRINGS["uz"]["help"],
+            parse_mode="HTML",
+        )
+        await update.message.reply_text(
             "🌐 Choose your language / Выберите язык / Tilni tanlang:",
             reply_markup=_lang_keyboard("lang_"),
         )
@@ -905,6 +929,15 @@ async def cmd_menu_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         STRINGS[_lang(uid)]["settings"],
         parse_mode="HTML",
         reply_markup=_lang_keyboard("setlang_"),
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        tx(uid, "help"),
+        parse_mode="HTML",
+        reply_markup=_main_menu_kb(_lang(uid)),
     )
 
 
@@ -2441,6 +2474,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("start",      "📅 Book / Записаться / Yozilish"),
         BotCommand("mybooking",  "📋 My booking / Моя запись / Mening yozilishim"),
         BotCommand("settings",   "⚙️ Language / Язык / Til"),
+        BotCommand("help",       "ℹ️ Help / Помощь / Yordam"),
     ]
     barber_commands = customer_commands + [
         BotCommand("bookings", "📋 Today's schedule / Сегодня"),
@@ -2527,6 +2561,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("config",    cmd_config))
     app.add_handler(CommandHandler("mybooking", cmd_mybooking))
+    app.add_handler(CommandHandler("help",      cmd_help))
     # /cancel also works outside an active booking conversation
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     # Persistent menu "language" button (outside conversation)
