@@ -2495,6 +2495,8 @@ def build_application() -> Application:
             CommandHandler("cancel",   cmd_cancel),
             # /settings mid-conversation: change language, then end the booking flow
             CommandHandler("settings", _settings_in_conv),
+            # "Choose language" persistent menu button mid-conversation
+            MessageHandler(_lang_filter, _settings_in_conv),
             # barber config callbacks must work even if barber is in conversation state
             CallbackQueryHandler(cb_config, pattern=r"^cfg_"),
             MessageHandler(filters.ALL, handle_unexpected),
