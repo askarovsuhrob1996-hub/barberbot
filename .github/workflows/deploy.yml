@@ -8,33 +8,55 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: miniapp/package-lock.json
+
+      - name: Build miniapp
+        run: |
+          cd miniapp
+          npm ci
+          npm run build
+
+      - name: Set up SSH key
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          # --- Set up SSH key ---
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-
-          # Write the key using printf to preserve exact content.
-          # The trailing newline is critical for OpenSSH key parsing.
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-
-          # Validate the key is parseable before attempting SSH
           ssh-keygen -l -f ~/.ssh/deploy_key
-
-          # Pre-populate known_hosts to avoid MITM prompt
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-          # --- Deploy ---
+      - name: Copy miniapp dist to VPS
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            miniapp/dist/ \
+            "$DEPLOY_USER@$DEPLOY_HOST:/home/ubuntu/barberbot/miniapp/dist/"
+
+      - name: Deploy backend & restart services
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_HOST" '
             set -e
             cd /home/ubuntu/barberbot
             git pull origin main
             ./venv/bin/pip install -q -r requirements.txt
             sudo systemctl restart barberbot
+            sudo systemctl restart barberapi
             echo "Deploy complete"
           '

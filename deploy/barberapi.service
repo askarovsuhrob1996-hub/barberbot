@@ -1,0 +1,19 @@
+[Unit]
+Description=Barber Shop FastAPI backend
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/barberbot
+ExecStart=/home/ubuntu/barberbot/venv/bin/uvicorn backend.api:app --host 127.0.0.1 --port 8000
+EnvironmentFile=/home/ubuntu/barberbot/.env
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=barberapi
+
+[Install]
+WantedBy=multi-user.target
