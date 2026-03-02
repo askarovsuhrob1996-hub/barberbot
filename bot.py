@@ -74,9 +74,10 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────── Config ──────────────────────────────────────────
 load_dotenv()
 
-BOT_TOKEN:      str = os.environ["BOT_TOKEN"]
-BARBER_CHAT_ID: int = int(os.environ["BARBER_CHAT_ID"])
-MINIAPP_URL:    str = os.getenv("MINIAPP_URL", "")   # e.g. https://yourdomain.com/
+BOT_TOKEN:       str  = os.environ["BOT_TOKEN"]
+BARBER_CHAT_ID:  int  = int(os.environ["BARBER_CHAT_ID"])
+MINIAPP_URL:     str  = os.getenv("MINIAPP_URL", "")
+MINIAPP_ENABLED: bool = os.getenv("MINIAPP_ENABLED", "false").lower() == "true"
 
 TZ         = ZoneInfo("Asia/Tashkent")   # UTC+5
 DAYS_AHEAD = 14
@@ -86,10 +87,9 @@ _CONFIG_FILE = Path(__file__).parent / "schedule_config.json"
 _DB_FILE     = Path(__file__).parent / "barber.db"
 
 _CONFIG_DEFAULTS: dict[str, Any] = {
-    "start_hour":     9,
-    "end_hour":       18,
-    "work_days":      [0, 1, 2, 3, 4, 5],   # stored as list in JSON, 0=Mon…6=Sun
-    "miniapp_enabled": False,               # если True — кнопка «Записаться» открывает Mini App
+    "start_hour": 9,
+    "end_hour":   18,
+    "work_days":  [0, 1, 2, 3, 4, 5],   # stored as list in JSON, 0=Mon…6=Sun
 }
 
 
@@ -98,10 +98,9 @@ def _load_config() -> dict[str, Any]:
         try:
             data = json.loads(_CONFIG_FILE.read_text())
             return {
-                "start_hour":      int(data["start_hour"]),
-                "end_hour":        int(data["end_hour"]),
-                "work_days":       set(data["work_days"]),
-                "miniapp_enabled": bool(data.get("miniapp_enabled", False)),
+                "start_hour": int(data["start_hour"]),
+                "end_hour":   int(data["end_hour"]),
+                "work_days":  set(data["work_days"]),
             }
         except Exception as exc:
             logger.warning("Could not load schedule config: %s — using defaults", exc)
@@ -110,10 +109,9 @@ def _load_config() -> dict[str, Any]:
 
 def _save_config() -> None:
     data = {
-        "start_hour":      schedule_config["start_hour"],
-        "end_hour":        schedule_config["end_hour"],
-        "work_days":       sorted(schedule_config["work_days"]),   # set → sorted list
-        "miniapp_enabled": schedule_config["miniapp_enabled"],
+        "start_hour": schedule_config["start_hour"],
+        "end_hour":   schedule_config["end_hour"],
+        "work_days":  sorted(schedule_config["work_days"]),   # set → sorted list
     }
     _CONFIG_FILE.write_text(json.dumps(data, indent=2))
     logger.info("Schedule config saved: %s", data)
@@ -633,8 +631,7 @@ MENU_LANG_TEXTS = {STRINGS["ru"]["menu_lang"], STRINGS["uz"]["menu_lang"]}
 
 def _main_menu_kb(lang: str) -> ReplyKeyboardMarkup:
     """Persistent two-button keyboard shown below the message input."""
-    use_miniapp = schedule_config.get("miniapp_enabled") and MINIAPP_URL
-    if use_miniapp:
+    if MINIAPP_ENABLED and MINIAPP_URL:
         book_btn = KeyboardButton(
             STRINGS[lang]["menu_book"],
             web_app=WebAppInfo(url=MINIAPP_URL),
@@ -1706,26 +1703,26 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def _config_main_text() -> str:
     cfg  = schedule_config
     days = " ".join(_DAY_SHORT[d] for d in sorted(cfg["work_days"])) or "—"
-    miniapp_status = "✅ Включён" if cfg.get("miniapp_enabled") else "❌ Выключен"
-    miniapp_url_line = f"\n🔗 URL:          <code>{MINIAPP_URL or 'не задан'}</code>" if cfg.get("miniapp_enabled") else ""
+    miniapp_line = (
+        f"\n📱 Mini App:     <b>✅ активен</b>  <code>{MINIAPP_URL}</code>"
+        if MINIAPP_ENABLED and MINIAPP_URL else
+        "\n📱 Mini App:     <b>❌ выкл</b>  (MINIAPP_ENABLED=false в .env)"
+    )
     return (
         "⚙️ <b>Настройка рабочего времени</b>\n\n"
         f"📅 Рабочие дни:  <b>{days}</b>\n"
         f"🕐 Начало:       <b>{cfg['start_hour']:02d}:00</b>\n"
-        f"🕐 Конец:        <b>{cfg['end_hour']:02d}:00</b>\n\n"
-        f"📱 Mini App:     <b>{miniapp_status}</b>{miniapp_url_line}"
+        f"🕐 Конец:        <b>{cfg['end_hour']:02d}:00</b>"
+        f"{miniapp_line}"
     )
 
 
 def _config_main_keyboard() -> InlineKeyboardMarkup:
-    miniapp_on = schedule_config.get("miniapp_enabled", False)
-    miniapp_label = "📱 Mini App: ✅ ВКЛ" if miniapp_on else "📱 Mini App: ❌ ВЫКЛ"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📅 Дни",  callback_data="cfg_days"),
             InlineKeyboardButton("🕐 Часы", callback_data="cfg_hours"),
         ],
-        [InlineKeyboardButton(miniapp_label, callback_data="cfg_miniapp_toggle")],
         [InlineKeyboardButton("✅ Готово", callback_data="cfg_done")],
     ])
 
@@ -1781,20 +1778,8 @@ async def cb_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     data = query.data   # cfg_main | cfg_days | cfg_hours | cfg_day_N |
                         # cfg_start_inc/dec | cfg_end_inc/dec | cfg_done | cfg_noop
-                        # cfg_miniapp_toggle
 
     if data == "cfg_noop":
-        return
-
-    if data == "cfg_miniapp_toggle":
-        if not MINIAPP_URL:
-            await query.answer("⚠️ MINIAPP_URL не задан в .env", show_alert=True)
-            return
-        schedule_config["miniapp_enabled"] = not schedule_config.get("miniapp_enabled", False)
-        _save_config()
-        await query.edit_message_text(
-            _config_main_text(), parse_mode="HTML", reply_markup=_config_main_keyboard()
-        )
         return
 
     if data == "cfg_done":
