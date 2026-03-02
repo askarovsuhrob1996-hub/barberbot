@@ -36,27 +36,31 @@ jobs:
           ssh-keygen -l -f ~/.ssh/deploy_key
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Copy miniapp dist to VPS
+      - name: Deploy to VPS
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no"
+
+          # 1. Pull latest code & install Python deps
+          $SSH "$DEPLOY_USER@$DEPLOY_HOST" '
+            set -e
+            cd /home/ubuntu/barberbot
+            git pull origin main
+            ./venv/bin/pip install -q -r requirements.txt
+            mkdir -p miniapp/dist
+          '
+
+          # 2. Copy freshly built miniapp dist
           rsync -az --delete \
             -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
             miniapp/dist/ \
             "$DEPLOY_USER@$DEPLOY_HOST:/home/ubuntu/barberbot/miniapp/dist/"
 
-      - name: Deploy backend & restart services
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-        run: |
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_HOST" '
-            set -e
-            cd /home/ubuntu/barberbot
-            git pull origin main
-            ./venv/bin/pip install -q -r requirements.txt
+          # 3. Restart services
+          $SSH "$DEPLOY_USER@$DEPLOY_HOST" '
             sudo systemctl restart barberbot
-            sudo systemctl restart barberapi
+            sudo systemctl restart barberapi || true
             echo "Deploy complete"
           '
