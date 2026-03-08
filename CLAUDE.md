@@ -25,15 +25,29 @@ pkill -9 -f "python bot.py"; pkill -9 SCREEN; sleep 3; screen -dmS barberbot bas
 
 # View logs (RotatingFileHandler: max 10 MB per file, 5 backups)
 tail -f bot.log
+
+# Run miniapp dev server
+cd miniapp && npm install && npm run dev
+
+# Run FastAPI backend (reads barber.db, services.json, schedule_config.json)
+uvicorn backend.api:app --host 127.0.0.1 --port 8000
 ```
 
-`.env` requires two keys: `BOT_TOKEN` (from @BotFather) and `BARBER_CHAT_ID` (the barber's Telegram user/chat ID).
+`.env` requires: `BOT_TOKEN` (from @BotFather), `BARBER_CHAT_ID` (barber's Telegram user/chat ID). Optional: `MINIAPP_ENABLED=true` and `MINIAPP_URL` to activate the WebApp button.
 
 ## Architecture
 
-Everything lives in a single file: **`bot.py`** (~2200 lines). SQLite (`barber.db`) provides persistence — in-memory dicts are the working copy, DB is the write-through store.
+**Three components** share a single SQLite database (`barber.db`) and JSON configs:
 
-### Data stores (module-level globals)
+| Component | Path | Tech | Purpose |
+|---|---|---|---|
+| Telegram Bot | `bot.py` (~2200 lines) | python-telegram-bot 21.5 | Core booking flow, barber approval, reminders |
+| FastAPI Backend | `backend/api.py` | FastAPI + uvicorn | REST API for the mini app (read-only slot queries + booking creation) |
+| Mini App | `miniapp/` | React 19 + Vite + Tailwind + @twa-dev/sdk | Telegram WebApp UI for customers |
+
+The bot and backend share identical slot-calculation logic but are **not** importing from each other — changes to slot logic must be replicated in both `bot.py` and `backend/api.py`.
+
+### Data stores (module-level globals in bot.py)
 
 | Variable | Type | Purpose |
 |---|---|---|
@@ -78,36 +92,42 @@ Slots are 30 min each. `_calc_duration(service_ids)` → `(total_mins, n_slots)`
 
 Slot keys use format `"YYYY-MM-DD HH:MM"` where MM is `00` or `30`.
 
-### Reminder jobs
+### Reminder & timeout jobs
 
-Two reminder jobs per confirmed booking:
-- **Customer reminder** (`reminder_{slot_key}`): `_schedule_reminder()` / `_cancel_reminder()` — sends customer the `reminder` string 30 min before.
-- **Barber reminder** (`barber_reminder_{slot_key}`): `_schedule_barber_reminder()` / `_cancel_barber_reminder()` — sends barber a concise appointment summary 30 min before.
+- **Customer reminder** (`reminder_{slot_key}`): 30 min before appointment.
+- **Barber reminder** (`barber_reminder_{slot_key}`): 30 min before appointment.
+- **Pending timeout** (`pending_timeout_{bid}`): 30 min after customer confirms; auto-rejects if barber hasn't acted.
 
-Both are scheduled on barber approve, cancelled on any cancellation, and rescheduled from DB on restart via `_post_init`.
-
-### Pending timeout jobs
-
-When a customer confirms a booking (`cb_confirm`), `_schedule_pending_timeout()` registers a job named `pending_timeout_{bid}` to fire in 30 minutes. If the barber hasn't acted, `_pending_timeout_job` auto-rejects, notifies customer (`pending_timeout` string), and edits the barber's approval message (using stored `barber_msg_id`) to remove stale buttons. On restart, `_post_init` re-schedules timeout jobs for pending bookings loaded from DB (firing in 5 s if already past deadline).
+All jobs are scheduled on booking events and restored from DB on restart via `_post_init`.
 
 ### Barber cancel confirmation
 
-When barber taps ❌ on a confirmed booking in `/bookings`, the flow is two-step:
-1. `bconfirm_{enc}` → `cb_barber_confirm_cancel` shows "Are you sure?" with ✅ Yes / ← Back
-2. `bcancel_{enc}` → `cb_barber_cancel_booking` actually cancels, notifies customer, returns to booking list
+Two-step: `bconfirm_{enc}` shows "Are you sure?" → `bcancel_{enc}` actually cancels and notifies customer.
 
 ### Customer reschedule flow
 
-`/mybooking` shows confirmed bookings with **🔄 Перенести** (`uresch_{enc}`) and **❌ Отменить** (`ucancel_{enc}`). The reschedule is a chain of global callbacks outside `ConversationHandler`:
+`/mybooking` shows confirmed bookings with reschedule/cancel buttons. Reschedule is a chain of global callbacks outside `ConversationHandler`: `uresch_` → `urdate_` → `urtime_` → `urconfirm`. `_date_keyboard` and `_time_keyboard` accept prefix/back/cancel/exclude params so both normal booking and reschedule reuse the same builders.
 
-`uresch_` → stores `reschedule_old_slot` in `user_data`, shows date picker (`urdate_` prefix)
-`urdate_` → stores new date, shows time picker (`urtime_` prefix, `exclude_slot_key=old_slot` so old slot appears free)
-`urtime_` → stores new time, shows confirmation
-`urconfirm` → pops old booking, cancels its reminders, checks `_can_fit`, creates new pending + notifies barber
-`urback` / `urback_date` → restore previous views
+### Backend API endpoints
 
-`_date_keyboard` and `_time_keyboard` accept `date_prefix`, `time_prefix`, `back_data`, `cancel_data`, `exclude_slot_key` so both normal booking and reschedule flow reuse the same builders.
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/services` | List services from services.json |
+| GET | `/api/dates` | Working dates with free slot counts |
+| GET | `/api/slots?date=YYYY-MM-DD` | Free time slots for a date |
+| GET | `/api/bookings?user_id=N` | Customer's bookings (confirmed + pending) |
+| POST | `/api/booking` | Create pending booking, notify barber via Bot API |
 
-### Working hours config
+The backend writes directly to `barber.db`; the bot picks up mini app bookings on next approve/reject cycle.
+
+## Deployment
+
+**Target**: Ubuntu VPS at `/home/ubuntu/barberbot`. Two systemd services: `barberbot` (the Telegram bot) and `barberapi` (FastAPI on port 8000). Nginx reverse-proxies the API and serves `miniapp/dist/` as static files.
+
+**CI/CD**: `.github/workflows/deploy.yml` — on push to `main`: builds miniapp (Node 20), SSH into VPS, `git pull`, `pip install`, rsync miniapp dist, restart both systemd services. Secrets: `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`.
+
+**First-time VPS setup**: `bash deploy/setup-vps.sh` (installs systemd service, prints nginx/SSL instructions).
+
+## Working hours config
 
 `schedule_config.json` stores `start_hour`, `end_hour`, and `work_days` (list of weekday ints, 0=Mon). Loaded at startup, written on every barber `/config` change. `DAYS_AHEAD = 14` controls how far ahead dates are shown.

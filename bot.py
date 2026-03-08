@@ -443,6 +443,22 @@ STRINGS: dict[str, dict[str, str]] = {
             "⏰ Напомню за 30 минут до визита\n\n"
             "Нажмите <b>✂️ Записаться</b> или /start чтобы начать 👇"
         ),
+        # ── info ──────────────────────────────────────────────────────────────
+        "info": (
+            "ℹ️ <b>О нашем барбершопе</b>\n\n"
+            "🕐 <b>Режим работы:</b>\n"
+            "{schedule}\n\n"
+            "✂️ <b>Услуги и цены:</b>\n"
+            "{services}\n\n"
+            "📌 <b>Как записаться:</b>\n"
+            "1. Нажмите <b>✂️ Записаться</b> или /start\n"
+            "2. Выберите дату и время\n"
+            "3. Выберите услуги\n"
+            "4. Подтвердите запись — мастер получит уведомление\n\n"
+            "📋 /mybooking — ваши записи (перенос, отмена)\n"
+            "🌐 /settings — сменить язык\n"
+            "⏰ Напомню за 30 минут до визита"
+        ),
     },
     "uz": {
         # ── language ──────────────────────────────────────────────────────────
@@ -617,6 +633,22 @@ STRINGS: dict[str, dict[str, str]] = {
             "🌐 /settings — tilni o'zgartirish (O'zbek / Русский)\n"
             "⏰ Tashrif oldidan 30 daqiqa oldin eslataman\n\n"
             "✂️ <b>Yozilish</b> tugmasini bosing yoki /start yuboring 👇"
+        ),
+        # ── info ──────────────────────────────────────────────────────────────
+        "info": (
+            "ℹ️ <b>Sartaroshxonamiz haqida</b>\n\n"
+            "🕐 <b>Ish vaqti:</b>\n"
+            "{schedule}\n\n"
+            "✂️ <b>Xizmatlar va narxlar:</b>\n"
+            "{services}\n\n"
+            "📌 <b>Qanday yozilish mumkin:</b>\n"
+            "1. <b>✂️ Yozilish</b> yoki /start bosing\n"
+            "2. Sana va vaqtni tanlang\n"
+            "3. Xizmatlarni tanlang\n"
+            "4. Tasdiqlang — usta xabar oladi\n\n"
+            "📋 /mybooking — yozilishlaringiz (ko'chirish, bekor qilish)\n"
+            "🌐 /settings — tilni o'zgartirish\n"
+            "⏰ Tashrif oldidan 30 daqiqa oldin eslataman"
         ),
     },
 }
@@ -914,12 +946,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info("User %s (%d) /start", name, uid)
 
     if "lang" not in customer_cache.get(uid, {}):
-        await update.message.reply_text(
-            STRINGS["ru"]["help"] + "\n\n——\n\n" + STRINGS["uz"]["help"],
-            parse_mode="HTML",
+        cfg = schedule_config
+        day_names_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        day_names_uz = ["Du", "Se", "Cho", "Pa", "Ju", "Sha", "Ya"]
+        days_ru = "–".join([day_names_ru[min(cfg["work_days"])],
+                            day_names_ru[max(cfg["work_days"])]]) if cfg["work_days"] else "—"
+        days_uz = "–".join([day_names_uz[min(cfg["work_days"])],
+                            day_names_uz[max(cfg["work_days"])]]) if cfg["work_days"] else "—"
+        hours = f"{cfg['start_hour']:02d}:00–{cfg['end_hour']:02d}:00"
+
+        svc_ru = ", ".join(s["ru_c"].lower() for s in SERVICES.values())
+        svc_uz = ", ".join(s["uz_c"].lower() for s in SERVICES.values())
+
+        greeting = (
+            f"👋 Добро пожаловать! | Xush kelibsiz!\n\n"
+            f"✂️ {svc_ru.capitalize()}\n"
+            f"🕐 {days_ru} {hours}\n"
+            f"📱 Запишитесь прямо здесь!\n\n"
+            f"✂️ {svc_uz.capitalize()}\n"
+            f"🕐 {days_uz} {hours}\n"
+            f"📱 Shu yerda yoziling!"
         )
+        await update.message.reply_text(greeting, parse_mode="HTML")
         await update.message.reply_text(
-            "🌐 Choose your language / Выберите язык / Tilni tanlang:",
+            "🌐 Выберите язык / Tilni tanlang:",
             reply_markup=_lang_keyboard("lang_"),
         )
         return STATE_LANG
@@ -948,6 +998,35 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         tx(uid, "help"),
         parse_mode="HTML",
         reply_markup=_main_menu_kb(_lang(uid)),
+    )
+
+
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    lang = _lang(uid)
+    cfg = schedule_config
+
+    # Schedule text
+    day_names_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    day_names_uz = ["Du", "Se", "Cho", "Pa", "Ju", "Sha", "Ya"]
+    day_names = day_names_ru if lang == "ru" else day_names_uz
+    days = ", ".join(day_names[d] for d in sorted(cfg["work_days"])) or "—"
+    schedule = f"{days}  |  {cfg['start_hour']:02d}:00 – {cfg['end_hour']:02d}:00"
+
+    # Services text
+    svc_lines = []
+    for svc_id, svc in SERVICES.items():
+        name = svc.get(f"{lang}_c", svc.get(lang, svc_id))
+        price = f"{svc['price_uzs']:,}".replace(",", " ")
+        svc_lines.append(f"• {name} — {svc['mins']} мин. — {price} сум"
+                         if lang == "ru" else
+                         f"• {name} — {svc['mins']} daq. — {price} so'm")
+    services_text = "\n".join(svc_lines) or "—"
+
+    await update.message.reply_text(
+        tx(uid, "info", schedule=schedule, services=services_text),
+        parse_mode="HTML",
+        reply_markup=_main_menu_kb(lang),
     )
 
 
@@ -2545,6 +2624,8 @@ def build_application() -> Application:
             CommandHandler("cancel",   cmd_cancel),
             # /settings mid-conversation: change language, then end the booking flow
             CommandHandler("settings", _settings_in_conv),
+            CommandHandler("help",     cmd_help),
+            CommandHandler("info",     cmd_info),
             # "Choose language" persistent menu button mid-conversation
             MessageHandler(_lang_filter, _settings_in_conv),
             # barber config callbacks must work even if barber is in conversation state
@@ -2578,6 +2659,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("config",    cmd_config))
     app.add_handler(CommandHandler("mybooking", cmd_mybooking))
     app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CommandHandler("info",      cmd_info))
     # /cancel also works outside an active booking conversation
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     # Persistent menu "language" button (outside conversation)
