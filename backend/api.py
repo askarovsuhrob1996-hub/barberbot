@@ -317,9 +317,10 @@ def _notify_barber(bid: int, bk: dict, services: dict):
     from urllib.error import URLError
 
     bot_token    = os.getenv("BOT_TOKEN", "")
-    barber_id    = os.getenv("BARBER_CHAT_ID", "")
-    if not bot_token or not barber_id:
+    barber_raw   = os.getenv("BARBER_CHAT_ID", "")
+    if not bot_token or not barber_raw:
         return
+    barber_id = barber_raw.split(",")[0].strip()  # primary barber
 
     svc_lines = []
     for sid in bk.get("services", []):

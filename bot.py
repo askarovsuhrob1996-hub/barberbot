@@ -75,9 +75,16 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 BOT_TOKEN:       str  = os.environ["BOT_TOKEN"]
-BARBER_CHAT_ID:  int  = int(os.environ["BARBER_CHAT_ID"])
+# Comma-separated list of barber chat IDs (first one is primary — receives notifications)
+_barber_raw = os.environ["BARBER_CHAT_ID"]
+BARBER_CHAT_IDS: set[int] = {int(x.strip()) for x in _barber_raw.split(",") if x.strip()}
+BARBER_CHAT_ID:  int  = int(_barber_raw.split(",")[0].strip())  # primary barber
 MINIAPP_URL:     str  = os.getenv("MINIAPP_URL", "")
 MINIAPP_ENABLED: bool = os.getenv("MINIAPP_ENABLED", "false").lower() == "true"
+
+
+def _is_barber(uid: int) -> bool:
+    return uid in BARBER_CHAT_IDS
 
 TZ         = ZoneInfo("Asia/Tashkent")   # UTC+5
 DAYS_AHEAD = 14
@@ -1414,7 +1421,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def cb_barber_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         await query.answer("Только мастер может одобрять записи.", show_alert=True)
         return
 
@@ -1473,7 +1480,7 @@ async def cb_barber_confirm_cancel(
     query = update.callback_query
     await query.answer()
 
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         return
 
     encoded  = query.data[len("bconfirm_"):]
@@ -1505,7 +1512,7 @@ async def cb_barber_cancel_booking(
     query = update.callback_query
     await query.answer()
 
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         await query.answer("Только мастер может отменять записи.", show_alert=True)
         return
 
@@ -1602,7 +1609,7 @@ def _build_manage_list() -> tuple[str, InlineKeyboardMarkup]:
 
 async def cb_bmanage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         await query.answer()
         return
     await query.answer()
@@ -1612,7 +1619,7 @@ async def cb_bmanage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cb_bselect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         await query.answer()
         return
     await query.answer()
@@ -1715,7 +1722,7 @@ def _build_day_schedule(d: date) -> tuple[str, InlineKeyboardMarkup]:
 async def cb_bday_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         return
     d = date.fromisoformat(query.data[len("bday_"):])
     text, kb = _build_day_schedule(d)
@@ -1723,7 +1730,7 @@ async def cb_bday_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         await update.message.reply_text("Эта команда только для мастера.")
         return
     text, kb = _build_day_schedule(datetime.now(tz=TZ).date())
@@ -1733,7 +1740,7 @@ async def cmd_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─────────────────────────── /week ───────────────────────────────────────────
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         await update.message.reply_text("Эта команда только для мастера.")
         return
 
@@ -1840,7 +1847,7 @@ def _config_hours_keyboard() -> InlineKeyboardMarkup:
 
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         await update.message.reply_text("Эта команда только для мастера.")
         return
     await update.message.reply_text(
@@ -1852,7 +1859,7 @@ async def cb_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         return
 
     data = query.data   # cfg_main | cfg_days | cfg_hours | cfg_day_N |
@@ -2438,7 +2445,7 @@ async def cb_bblock_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Show date picker to choose a slot to block."""
     query = update.callback_query
     await query.answer()
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         return
     await query.edit_message_text(
         "🚫 <b>Заблокировать слот</b>\n\nВыберите дату:",
@@ -2451,7 +2458,7 @@ async def cb_bblock_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Date chosen — show time picker."""
     query = update.callback_query
     await query.answer()
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         return
     d = date.fromisoformat(query.data[len("bblkdate_"):])
     context.user_data["bblock_date"] = d
@@ -2470,7 +2477,7 @@ async def cb_bblock_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Time chosen — ask confirmation."""
     query = update.callback_query
     await query.answer()
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         return
     t = query.data[len("bblktime_"):]
     d = context.user_data.get("bblock_date")
@@ -2494,7 +2501,7 @@ async def cb_bblock_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Confirm block — save to memory and DB."""
     query = update.callback_query
     await query.answer()
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         return
     d = context.user_data.pop("bblock_date", None)
     t = context.user_data.pop("bblock_time", None)
@@ -2517,7 +2524,7 @@ async def cb_bblock_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Unblock a previously blocked slot."""
     query = update.callback_query
     await query.answer()
-    if update.effective_user.id != BARBER_CHAT_ID:
+    if not _is_barber(update.effective_user.id):
         return
     encoded  = query.data[len("bblkunblock_"):]
     slot_key = encoded.replace("_", " ", 1)
@@ -2579,10 +2586,11 @@ async def _post_init(app: Application) -> None:
 
     # Default menu for all customers
     await app.bot.set_my_commands(customer_commands, scope=BotCommandScopeDefault())
-    # Extended menu for the barber only
-    await app.bot.set_my_commands(
-        barber_commands, scope=BotCommandScopeChat(chat_id=BARBER_CHAT_ID)
-    )
+    # Extended menu for all barbers
+    for bid in BARBER_CHAT_IDS:
+        await app.bot.set_my_commands(
+            barber_commands, scope=BotCommandScopeChat(chat_id=bid)
+        )
     logger.info("Bot command menus registered.")
 
 
