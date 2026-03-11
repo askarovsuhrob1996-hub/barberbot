@@ -86,6 +86,19 @@ MINIAPP_ENABLED: bool = os.getenv("MINIAPP_ENABLED", "false").lower() == "true"
 def _is_barber(uid: int) -> bool:
     return uid in BARBER_CHAT_IDS
 
+
+async def _send_to_all_barbers(bot, **kwargs):
+    """Send a message to all barbers. Returns the message sent to the primary barber."""
+    primary_msg = None
+    for bid in BARBER_CHAT_IDS:
+        try:
+            msg = await bot.send_message(chat_id=bid, **kwargs)
+            if bid == BARBER_CHAT_ID:
+                primary_msg = msg
+        except Exception as exc:
+            logger.error("Send to barber %d failed: %s", bid, exc)
+    return primary_msg
+
 TZ         = ZoneInfo("Asia/Tashkent")   # UTC+5
 DAYS_AHEAD = 14
 
@@ -1387,26 +1400,23 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     total_price = _calc_total_price(services)
     price_ru    = _price_line(total_price, "ru")
     price_part  = f"\n{price_ru}" if price_ru else ""
-    try:
-        barber_msg = await query.get_bot().send_message(
-            chat_id=BARBER_CHAT_ID,
-            text=(
-                f"🔔 <b>Новая заявка!</b>\n\n"
-                f"📅 {date_str}\n"
-                f"🕐 {time_range}\n"
-                f"👤 {name}\n"
-                f"📞 {phone}\n"
-                f"✂️ {svc_ru}\n"
-                f"⏱ ~{total_mins} мин.{price_part}"
-            ),
-            parse_mode="HTML",
-            reply_markup=_approval_keyboard(bid),
-        )
-        # Store message ID so timeout job can strike the approval buttons later
+    barber_msg = await _send_to_all_barbers(
+        query.get_bot(),
+        text=(
+            f"🔔 <b>Новая заявка!</b>\n\n"
+            f"📅 {date_str}\n"
+            f"🕐 {time_range}\n"
+            f"👤 {name}\n"
+            f"📞 {phone}\n"
+            f"✂️ {svc_ru}\n"
+            f"⏱ ~{total_mins} мин.{price_part}"
+        ),
+        parse_mode="HTML",
+        reply_markup=_approval_keyboard(bid),
+    )
+    if barber_msg:
         pending_bookings[bid]["barber_msg_id"] = barber_msg.message_id
         _db_save_pending(bid, pending_bookings[bid])
-    except Exception as exc:
-        logger.error("Barber notify failed: %s", exc)
 
     await query.edit_message_text(
         tx(uid, "waiting", date=date_str, time=time_range),
@@ -1979,18 +1989,15 @@ def _cancel_reminder(app, slot_key: str) -> None:
 async def _send_barber_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
     svc_text = ", ".join(_svc_label(s, "ru") for s in data["services"])
-    try:
-        await context.bot.send_message(
-            chat_id=BARBER_CHAT_ID,
-            text=(
-                f"🔔 <b>Через 30 мин:</b> {data['name']}\n"
-                f"🕐 {data['time_range']}\n"
-                f"✂️ {svc_text}"
-            ),
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        logger.error("Barber reminder send failed: %s", exc)
+    await _send_to_all_barbers(
+        context.bot,
+        text=(
+            f"🔔 <b>Через 30 мин:</b> {data['name']}\n"
+            f"🕐 {data['time_range']}\n"
+            f"✂️ {svc_text}"
+        ),
+        parse_mode="HTML",
+    )
 
 
 def _schedule_barber_reminder(app, booking: dict) -> None:
@@ -2049,23 +2056,23 @@ async def _pending_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 {bk.get('date_str', bk['slot_key'].split()[0])}\n"
         f"🕐 {bk.get('time_range', bk['slot_key'].split()[1])}"
     )
-    try:
-        if barber_msg_id:
-            # Edit the original approval message — remove the stale buttons
-            await context.bot.edit_message_text(
-                chat_id=BARBER_CHAT_ID,
-                message_id=barber_msg_id,
-                text=timeout_text,
-                parse_mode="HTML",
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=BARBER_CHAT_ID,
-                text=timeout_text,
-                parse_mode="HTML",
-            )
-    except Exception as exc:
-        logger.error("Timeout barber notify failed: %s", exc)
+    for bid in BARBER_CHAT_IDS:
+        try:
+            if barber_msg_id and bid == BARBER_CHAT_ID:
+                await context.bot.edit_message_text(
+                    chat_id=bid,
+                    message_id=barber_msg_id,
+                    text=timeout_text,
+                    parse_mode="HTML",
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=bid,
+                    text=timeout_text,
+                    parse_mode="HTML",
+                )
+        except Exception as exc:
+            logger.error("Timeout barber notify %d failed: %s", bid, exc)
 
 
 def _cancel_pending_timeout(app, bid: int) -> None:
@@ -2149,18 +2156,15 @@ async def cb_user_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         _db_delete_booking(slot_key)
         _cancel_reminder(context.application, slot_key)
         _cancel_barber_reminder(context.application, slot_key)
-        try:
-            await query.get_bot().send_message(
-                chat_id=BARBER_CHAT_ID,
-                text=STRINGS["ru"]["cancelled_by_user_barber"].format(
-                    name=booking["name"],
-                    date=booking.get("date_str", slot_key.split()[0]),
-                    time=booking.get("time_range", slot_key.split()[1]),
-                ),
-                parse_mode="HTML",
-            )
-        except Exception as exc:
-            logger.error("Barber user-cancel notify failed: %s", exc)
+        await _send_to_all_barbers(
+            query.get_bot(),
+            text=STRINGS["ru"]["cancelled_by_user_barber"].format(
+                name=booking["name"],
+                date=booking.get("date_str", slot_key.split()[0]),
+                time=booking.get("time_range", slot_key.split()[1]),
+            ),
+            parse_mode="HTML",
+        )
         await query.edit_message_text(tx(uid, "cancelled_by_user"), parse_mode="HTML")
         return
 
@@ -2170,18 +2174,15 @@ async def cb_user_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pending_bookings.pop(bid)
             _db_delete_pending(bid)
             _cancel_pending_timeout(context.application, bid)
-            try:
-                await query.get_bot().send_message(
-                    chat_id=BARBER_CHAT_ID,
-                    text=STRINGS["ru"]["cancelled_by_user_barber"].format(
-                        name=bk["name"],
-                        date=bk.get("date_str", slot_key.split()[0]),
-                        time=bk.get("time_range", slot_key.split()[1]),
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception as exc:
-                logger.error("Barber user-cancel notify failed: %s", exc)
+            await _send_to_all_barbers(
+                query.get_bot(),
+                text=STRINGS["ru"]["cancelled_by_user_barber"].format(
+                    name=bk["name"],
+                    date=bk.get("date_str", slot_key.split()[0]),
+                    time=bk.get("time_range", slot_key.split()[1]),
+                ),
+                parse_mode="HTML",
+            )
             await query.edit_message_text(tx(uid, "cancelled_by_user"), parse_mode="HTML")
             return
 
@@ -2370,23 +2371,20 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     old_date_str = old_bk.get("date_str", old_slot.split()[0])
     old_time_str = old_bk.get("time_range", old_slot.split()[1])
     svc_ru       = ", ".join(_svc_label(s, "ru") for s in old_bk["services"])
-    try:
-        await query.get_bot().send_message(
-            chat_id=BARBER_CHAT_ID,
-            text=(
-                f"🔄 <b>Запрос на перенос!</b>\n\n"
-                f"👤 {old_bk['name']}\n"
-                f"📞 {old_bk['phone']}\n"
-                f"❌ Было:  {old_date_str}  {old_time_str}\n"
-                f"✅ Стало: {new_date_str}  {new_tr}\n"
-                f"✂️ {svc_ru}\n"
-                f"⏱ ~{old_bk.get('duration_mins', 30)} мин."
-            ),
-            parse_mode="HTML",
-            reply_markup=_approval_keyboard(bid),
-        )
-    except Exception as exc:
-        logger.error("Barber reschedule notify failed: %s", exc)
+    await _send_to_all_barbers(
+        query.get_bot(),
+        text=(
+            f"🔄 <b>Запрос на перенос!</b>\n\n"
+            f"👤 {old_bk['name']}\n"
+            f"📞 {old_bk['phone']}\n"
+            f"❌ Было:  {old_date_str}  {old_time_str}\n"
+            f"✅ Стало: {new_date_str}  {new_tr}\n"
+            f"✂️ {svc_ru}\n"
+            f"⏱ ~{old_bk.get('duration_mins', 30)} мин."
+        ),
+        parse_mode="HTML",
+        reply_markup=_approval_keyboard(bid),
+    )
 
     await query.edit_message_text(
         tx(uid, "reschedule_waiting", date=new_date_str, time=new_tr),
