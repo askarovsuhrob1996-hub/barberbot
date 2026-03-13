@@ -13,7 +13,7 @@
     "ru_c":    "Стрижка бороды",
     "uz_c":    "Soqol kesish",
     "mins":    60,
-    "price_uzs": 80000
+    "price_uzs": 30000
   },
 
   "svc_beard_color": {
