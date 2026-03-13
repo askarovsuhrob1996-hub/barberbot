@@ -979,13 +979,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         svc_uz = ", ".join(s["uz_c"].lower() for s in SERVICES.values())
 
         greeting = (
-            f"👋 Добро пожаловать! | Xush kelibsiz!\n\n"
-            f"✂️ {svc_ru.capitalize()}\n"
-            f"🕐 {days_ru} {hours}\n"
-            f"📱 Запишитесь прямо здесь!\n\n"
-            f"✂️ {svc_uz.capitalize()}\n"
-            f"🕐 {days_uz} {hours}\n"
-            f"📱 Shu yerda yoziling!"
+            f"✂️ <b>BARBER STUDIO</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👋 Добро пожаловать!\n"
+            f"Мы — ваш персональный барбершоп.\n\n"
+            f"💈 <b>Услуги:</b> {svc_ru}\n"
+            f"🕐 <b>График:</b> {days_ru}, {hours}\n"
+            f"📱 <b>Запись</b> — прямо здесь, в два клика!\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👋 Xush kelibsiz!\n"
+            f"Biz — sizning shaxsiy sartaroshxonangiz.\n\n"
+            f"💈 <b>Xizmatlar:</b> {svc_uz}\n"
+            f"🕐 <b>Ish vaqti:</b> {days_uz}, {hours}\n"
+            f"📱 <b>Yozilish</b> — shu yerda, ikki bosishda!"
         )
         await update.message.reply_text(greeting, parse_mode="HTML")
         await update.message.reply_text(
@@ -1362,14 +1368,6 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if not _can_fit(d, t, n_slots):
         await query.edit_message_text(tx(uid, "slot_race"))
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    # Prevent double-booking: one active booking per user
-    has_confirmed = any(bk.get("user_id") == uid for bk in appointments.values())
-    has_pending   = any(bk.get("user_id") == uid for bk in pending_bookings.values())
-    if has_confirmed or has_pending:
-        await query.edit_message_text(tx(uid, "already_booked"))
         context.user_data.clear()
         return ConversationHandler.END
 

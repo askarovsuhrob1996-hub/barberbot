@@ -1,12 +1,21 @@
 {
-  "svc_haircut_beard": {
-    "ru":      "Стрижка + борода",
-    "uz":      "Soch + soqol",
-    "ru_c":    "Стрижка + борода",
-    "uz_c":    "Soch + soqol",
+  "svc_haircut": {
+    "ru":      "Стрижка волос",
+    "uz":      "Soch kesish",
+    "ru_c":    "Стрижка волос",
+    "uz_c":    "Soch kesish",
     "mins":    60,
     "price_uzs": 80000
   },
+  "svc_haircut": {
+    "ru":      "Стрижка бороды",
+    "uz":      "Soqol kesish",
+    "ru_c":    "Стрижка бороды",
+    "uz_c":    "Soqol kesish",
+    "mins":    60,
+    "price_uzs": 80000
+  },
+
   "svc_beard_color": {
     "ru":      "Покраска бороды",
     "uz":      "Soqol bo'yash",
