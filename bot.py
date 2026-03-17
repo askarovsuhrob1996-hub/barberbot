@@ -1340,10 +1340,25 @@ async def cb_service_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         svc_text = ", ".join(_svc_client_label(s, lang) for s in selected)
 
+        confirm_msg = tx(uid, "confirm_text",
+                         date=_fmt_date(d, lang), time=time_range,
+                         dur=total_mins, name=name, phone=phone, svcs=svc_text)
+        if overflow > 0:
+            if lang == "uz":
+                confirm_msg += (
+                    f"\n\n⚠️ <b>Diqqat:</b> yozilish ish vaqtidan "
+                    f"<b>{overflow} daqiqa</b> oshib ketadi. "
+                    f"Usta tasdiqlaganidan keyin tashrif buyurishingiz mumkin."
+                )
+            else:
+                confirm_msg += (
+                    f"\n\n⚠️ <b>Внимание:</b> запись выходит за рабочие часы "
+                    f"на <b>{overflow} мин.</b> "
+                    f"Если мастер примет заявку — можете приходить!"
+                )
+
         await query.edit_message_text(
-            tx(uid, "confirm_text",
-               date=_fmt_date(d, lang), time=time_range,
-               dur=total_mins, name=name, phone=phone, svcs=svc_text),
+            confirm_msg,
             parse_mode="HTML",
             reply_markup=_confirm_keyboard(lang),
         )
@@ -1433,8 +1448,20 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         pending_bookings[bid]["barber_msg_id"] = barber_msg.message_id
         _db_save_pending(bid, pending_bookings[bid])
 
+    waiting_msg = tx(uid, "waiting", date=date_str, time=time_range)
+    if overflow > 0:
+        if lang == "uz":
+            waiting_msg += (
+                f"\n\n⚠️ Yozilish ish vaqtidan <b>{overflow} daqiqa</b> oshadi. "
+                f"Usta tasdiqlaganida xabar beramiz!"
+            )
+        else:
+            waiting_msg += (
+                f"\n\n⚠️ Запись выходит за рабочие часы на <b>{overflow} мин.</b> "
+                f"Если мастер подтвердит — сообщим!"
+            )
     await query.edit_message_text(
-        tx(uid, "waiting", date=date_str, time=time_range),
+        waiting_msg,
         parse_mode="HTML",
     )
     context.user_data.clear()
