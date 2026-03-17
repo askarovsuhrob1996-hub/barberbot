@@ -826,11 +826,19 @@ def _available_slots(for_date: date, exclude_slot_key: str | None = None) -> lis
     return slots
 
 
-def _can_fit(for_date: date, start_time: str, n_slots: int) -> bool:
+def _overflow_minutes(start_time: str, n_slots: int) -> int:
+    """Minutes by which booking exceeds end_hour.  0 = fits within schedule."""
+    h, m      = int(start_time.split(":")[0]), int(start_time.split(":")[1])
+    end_min   = schedule_config["end_hour"] * 60
+    return max(0, h * 60 + m + n_slots * 30 - end_min)
+
+
+def _can_fit(for_date: date, start_time: str, n_slots: int,
+             *, allow_overflow: bool = False) -> bool:
     h, m      = int(start_time.split(":")[0]), int(start_time.split(":")[1])
     start_min = h * 60 + m
     end_min   = schedule_config["end_hour"] * 60
-    if start_min + n_slots * 30 > end_min:
+    if start_min + n_slots * 30 > end_min and not allow_overflow:
         return False
     taken = _all_taken_slots()
     iso   = for_date.isoformat()
@@ -1314,7 +1322,7 @@ async def cb_service_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         phone      = context.user_data["phone"]
         total_mins, n_slots = _calc_duration(list(selected))
 
-        if not _can_fit(d, t, n_slots):
+        if not _can_fit(d, t, n_slots, allow_overflow=True):
             await query.edit_message_text(
                 tx(uid, "no_consec", n=n_slots),
                 parse_mode="HTML",
@@ -1323,10 +1331,12 @@ async def cb_service_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data.pop("services", None)
             return STATE_TIME
 
+        overflow = _overflow_minutes(t, n_slots)
         time_range = _fmt_time_range(t, n_slots)
         context.user_data["duration_slots"] = n_slots
         context.user_data["duration_mins"]  = total_mins
         context.user_data["time_range"]     = time_range
+        context.user_data["overflow_mins"]  = overflow
 
         svc_text = ", ".join(_svc_client_label(s, lang) for s in selected)
 
@@ -1366,10 +1376,12 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     time_range = context.user_data.get("time_range", t)
     date_str   = _fmt_date(d, lang)
 
-    if not _can_fit(d, t, n_slots):
+    if not _can_fit(d, t, n_slots, allow_overflow=True):
         await query.edit_message_text(tx(uid, "slot_race"))
         context.user_data.clear()
         return ConversationHandler.END
+
+    overflow = context.user_data.get("overflow_mins", 0)
 
     bid = _next_id()
     pending_bookings[bid] = {
@@ -1398,6 +1410,10 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     total_price = _calc_total_price(services)
     price_ru    = _price_line(total_price, "ru")
     price_part  = f"\n{price_ru}" if price_ru else ""
+    overflow_warning = (
+        f"\n\n⚠️ <b>Выходит за рабочие часы на {overflow} мин!</b>"
+        if overflow > 0 else ""
+    )
     barber_msg = await _send_to_all_barbers(
         query.get_bot(),
         text=(
@@ -1408,6 +1424,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"📞 {phone}\n"
             f"✂️ {svc_ru}\n"
             f"⏱ ~{total_mins} мин.{price_part}"
+            f"{overflow_warning}"
         ),
         parse_mode="HTML",
         reply_markup=_approval_keyboard(bid),
@@ -2327,7 +2344,7 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     new_slot   = f"{new_date.isoformat()} {new_time}"
     n_slots    = old_bk.get("duration_slots", 1)
 
-    if not _can_fit(new_date, new_time, n_slots):
+    if not _can_fit(new_date, new_time, n_slots, allow_overflow=True):
         # New slot taken — restore old booking and tell user to pick again
         appointments[old_slot] = old_bk
         _db_save_booking(old_slot, old_bk)
@@ -2345,6 +2362,8 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=kb or _date_keyboard(lang, date_prefix="urdate", cancel_data="urback"),
         )
         return
+
+    overflow = _overflow_minutes(new_time, n_slots)
 
     # Create new pending booking with updated slot
     bid          = _next_id()
@@ -2369,6 +2388,10 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     old_date_str = old_bk.get("date_str", old_slot.split()[0])
     old_time_str = old_bk.get("time_range", old_slot.split()[1])
     svc_ru       = ", ".join(_svc_label(s, "ru") for s in old_bk["services"])
+    overflow_warning = (
+        f"\n\n⚠️ <b>Выходит за рабочие часы на {overflow} мин!</b>"
+        if overflow > 0 else ""
+    )
     await _send_to_all_barbers(
         query.get_bot(),
         text=(
@@ -2379,6 +2402,7 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"✅ Стало: {new_date_str}  {new_tr}\n"
             f"✂️ {svc_ru}\n"
             f"⏱ ~{old_bk.get('duration_mins', 30)} мин."
+            f"{overflow_warning}"
         ),
         parse_mode="HTML",
         reply_markup=_approval_keyboard(bid),

@@ -294,6 +294,11 @@ def create_booking(body: BookingRequest):
         "booked_at":     datetime.now(tz=TZ).isoformat(),
     }
 
+    # overflow check
+    end_hour_min = cfg["end_hour"] * 60
+    h, m_ = int(body.time.split(":")[0]), int(body.time.split(":")[1])
+    overflow = max(0, h * 60 + m_ + total_mins - end_hour_min)
+
     # записываем в DB
     with get_db() as conn:
         # получаем следующий bid
@@ -306,12 +311,12 @@ def create_booking(body: BookingRequest):
         conn.commit()
 
     # уведомляем мастера через Bot API
-    _notify_barber(bid, bk_data, services)
+    _notify_barber(bid, bk_data, services, overflow_mins=overflow)
 
     return {"ok": True, "bid": bid, "slot_key": slot_key, "time_range": time_range}
 
 
-def _notify_barber(bid: int, bk: dict, services: dict):
+def _notify_barber(bid: int, bk: dict, services: dict, *, overflow_mins: int = 0):
     """Шлёт уведомление мастеру через Telegram Bot API."""
     import urllib.request
     from urllib.error import URLError
@@ -327,6 +332,11 @@ def _notify_barber(bid: int, bk: dict, services: dict):
         s = services.get(sid, {})
         svc_lines.append(f"{s.get('ru','?')} — {s.get('price_uzs',0):,} сум".replace(",", " "))
 
+    overflow_warning = (
+        f"\n\n⚠️ <b>Выходит за рабочие часы на {overflow_mins} мин!</b>"
+        if overflow_mins > 0 else ""
+    )
+
     text = (
         f"📱 <b>Заявка из Mini App!</b>\n\n"
         f"📅 {bk['date_str']}\n"
@@ -337,6 +347,7 @@ def _notify_barber(bid: int, bk: dict, services: dict):
         f"⏱ ~{bk['duration_mins']} мин.\n"
         f"💰 {bk['total_price']:,} сум\n\n".replace(",", " ") +
         f"<i>Одобрение через /bookings или кнопку ниже</i>"
+        f"{overflow_warning}"
     )
 
     kb = json.dumps({
