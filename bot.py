@@ -88,16 +88,24 @@ def _is_barber(uid: int) -> bool:
 
 
 async def _send_to_all_barbers(bot, **kwargs):
-    """Send a message to all barbers. Returns the message sent to the primary barber."""
-    primary_msg = None
+    """Send a message to all barbers. Returns dict {chat_id: message} for all sent."""
+    results = {}
     for bid in BARBER_CHAT_IDS:
         try:
             msg = await bot.send_message(chat_id=bid, **kwargs)
-            if bid == BARBER_CHAT_ID:
-                primary_msg = msg
+            results[bid] = msg
         except Exception as exc:
             logger.error("Send to barber %d failed: %s", bid, exc)
-    return primary_msg
+    return results
+
+
+async def _edit_all_barber_msgs(bot, barber_msg_ids: dict, **kwargs):
+    """Edit previously sent messages for all barbers."""
+    for bid_str, msg_id in barber_msg_ids.items():
+        try:
+            await bot.edit_message_text(chat_id=int(bid_str), message_id=msg_id, **kwargs)
+        except Exception as exc:
+            logger.error("Edit barber msg %d/%d failed: %s", int(bid_str), msg_id, exc)
 
 TZ         = ZoneInfo("Asia/Tashkent")   # UTC+5
 DAYS_AHEAD = 14
@@ -1445,7 +1453,10 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=_approval_keyboard(bid),
     )
     if barber_msg:
-        pending_bookings[bid]["barber_msg_id"] = barber_msg.message_id
+        # Store {chat_id: message_id} for all barbers so we can edit all later
+        pending_bookings[bid]["barber_msg_ids"] = {
+            str(cid): m.message_id for cid, m in barber_msg.items()
+        }
         _db_save_pending(bid, pending_bookings[bid])
 
     waiting_msg = tx(uid, "waiting", date=date_str, time=time_range)
@@ -1492,15 +1503,16 @@ async def cb_barber_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
     _cancel_pending_timeout(context.application, bid)
     cust_lang = booking.get("user_lang", "ru")
 
+    barber_msg_ids = booking.get("barber_msg_ids", {})
+    status_text = query.message.text
+
     if action == "approve":
         appointments[booking["slot_key"]] = booking
         _db_save_booking(booking["slot_key"], booking)
         _schedule_reminder(context.application, booking)
         _schedule_barber_reminder(context.application, booking)
         logger.info("Approved #%d %s", bid, booking["slot_key"])
-        await query.edit_message_text(
-            query.message.text + "\n\n✅ <b>Одобрено</b>", parse_mode="HTML"
-        )
+        updated_text = status_text + "\n\n✅ <b>Одобрено</b>"
         cust_text = STRINGS[cust_lang]["approved"].format(
             date=booking["date_str"],
             time=booking["time_range"],
@@ -1508,12 +1520,25 @@ async def cb_barber_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     else:
         logger.info("Rejected #%d %s", bid, booking["slot_key"])
-        await query.edit_message_text(
-            query.message.text + "\n\n❌ <b>Отклонено</b>", parse_mode="HTML"
-        )
+        updated_text = status_text + "\n\n❌ <b>Отклонено</b>"
         cust_text = STRINGS[cust_lang]["rejected"].format(
             date=booking["date_str"], time=booking["time_range"]
         )
+
+    # Edit the message for the barber who clicked
+    await query.edit_message_text(updated_text, parse_mode="HTML")
+    # Edit messages for all other barbers
+    actor_id = str(update.effective_user.id)
+    for cid_str, msg_id in barber_msg_ids.items():
+        if cid_str == actor_id:
+            continue
+        try:
+            await query.get_bot().edit_message_text(
+                chat_id=int(cid_str), message_id=msg_id,
+                text=updated_text, parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.error("Edit barber msg %s/%d failed: %s", cid_str, msg_id, exc)
 
     try:
         await query.get_bot().send_message(
@@ -2091,30 +2116,22 @@ async def _pending_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         logger.error("Timeout customer notify failed: %s", exc)
 
-    barber_msg_id = bk.get("barber_msg_id")
+    barber_msg_ids = bk.get("barber_msg_ids", {})
     timeout_text  = (
         f"⌛ <b>Заявка истекла</b> (30 мин без ответа)\n\n"
         f"👤 {bk['name']}\n"
         f"📅 {bk.get('date_str', bk['slot_key'].split()[0])}\n"
         f"🕐 {bk.get('time_range', bk['slot_key'].split()[1])}"
     )
-    for bid in BARBER_CHAT_IDS:
-        try:
-            if barber_msg_id and bid == BARBER_CHAT_ID:
-                await context.bot.edit_message_text(
-                    chat_id=bid,
-                    message_id=barber_msg_id,
-                    text=timeout_text,
-                    parse_mode="HTML",
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=bid,
-                    text=timeout_text,
-                    parse_mode="HTML",
-                )
-        except Exception as exc:
-            logger.error("Timeout barber notify %d failed: %s", bid, exc)
+    if barber_msg_ids:
+        await _edit_all_barber_msgs(
+            context.bot, barber_msg_ids,
+            text=timeout_text, parse_mode="HTML",
+        )
+    else:
+        await _send_to_all_barbers(
+            context.bot, text=timeout_text, parse_mode="HTML",
+        )
 
 
 def _cancel_pending_timeout(app, bid: int) -> None:
