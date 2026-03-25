@@ -1418,7 +1418,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     customer_cache.setdefault(uid, {}).update(name=name, phone=phone)
     _db_save_pending(bid, pending_bookings[bid])
     _db_save_customer(uid)
-    _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
+    # _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
 
     # Barber notification — always in Russian, with prices
     svc_ru      = ", ".join(_svc_label(s, "ru") for s in services)
@@ -2408,7 +2408,7 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     }
     pending_bookings[bid] = new_bk
     _db_save_pending(bid, new_bk)
-    _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
+    # _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
 
     logger.info("Reschedule #%d: %s → %s (%s)", bid, old_slot, new_slot, old_bk["name"])
 
@@ -2603,21 +2603,10 @@ async def _post_init(app: Application) -> None:
         _schedule_reminder(app, bk)
         _schedule_barber_reminder(app, bk)
 
-    # Reschedule pending-timeout jobs for bookings loaded from DB on restart
-    now = datetime.now(tz=TZ)
-    for bid, bk in list(pending_bookings.items()):
-        booked_at_raw = bk.get("booked_at")
-        if booked_at_raw:
-            booked_at = datetime.fromisoformat(booked_at_raw)
-            if booked_at.tzinfo is None:
-                booked_at = booked_at.replace(tzinfo=TZ)
-            expires_at = booked_at + timedelta(minutes=30)
-        else:
-            expires_at = now  # unknown age — expire immediately
-        # If already past deadline, fire in 5 s; otherwise at the original deadline
-        when = max(expires_at, now + timedelta(seconds=5))
-        _schedule_pending_timeout(app, bid, when)
-        logger.info("Re-scheduled timeout for pending #%d at %s", bid, when)
+    # Pending timeout disabled — bookings wait indefinitely for barber response
+    # for bid, bk in list(pending_bookings.items()):
+    #     _schedule_pending_timeout(app, bid, ...)
+    logger.info("Pending timeout disabled — %d pending bookings loaded", len(pending_bookings))
 
     customer_commands = [
         BotCommand("start",      "📅 Book / Записаться / Yozilish"),
