@@ -171,6 +171,14 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS blocked_slots (
                 slot_key TEXT PRIMARY KEY
             );
+            CREATE TABLE IF NOT EXISTS booking_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        TEXT    NOT NULL,
+                event     TEXT    NOT NULL,
+                slot_key  TEXT,
+                user_id   INTEGER,
+                data      TEXT
+            );
         """)
     logger.info("DB initialised: %s", _DB_FILE)
 
@@ -261,6 +269,22 @@ def _db_delete_blocked(slot_key: str) -> None:
             conn.execute("DELETE FROM blocked_slots WHERE slot_key = ?", (slot_key,))
     except Exception as exc:
         logger.error("DB delete_blocked failed for %s: %s", slot_key, exc)
+
+
+def _db_log_event(event: str, slot_key: str | None, user_id: int | None,
+                  data: dict | None = None) -> None:
+    """Append a row to booking_log. Events: created, approved, rejected,
+    cancelled_barber, cancelled_user, timeout, rescheduled."""
+    try:
+        with sqlite3.connect(_DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO booking_log (ts, event, slot_key, user_id, data) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (datetime.now(tz=TZ).isoformat(), event, slot_key,
+                 user_id, json.dumps(data) if data else None),
+            )
+    except Exception as exc:
+        logger.error("DB log_event failed (%s %s): %s", event, slot_key, exc)
 
 
 # Short day labels for the config UI (Russian, barber-facing)
@@ -1427,6 +1451,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     customer_cache.setdefault(uid, {}).update(name=name, phone=phone)
     _db_save_pending(bid, pending_bookings[bid])
     _db_save_customer(uid)
+    _db_log_event("created", slot_key, uid, {"services": services, "duration_mins": total_mins})
     # _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
 
     # Barber notification — always in Russian, with prices
@@ -1513,6 +1538,7 @@ async def cb_barber_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         _schedule_reminder(context.application, booking)
         _schedule_barber_reminder(context.application, booking)
         logger.info("Approved #%d %s", bid, booking["slot_key"])
+        _db_log_event("approved", booking["slot_key"], booking.get("user_id"))
         updated_text = status_text + "\n\n✅ <b>Одобрено</b>"
         cust_text = STRINGS[cust_lang]["approved"].format(
             date=booking["date_str"],
@@ -1521,6 +1547,7 @@ async def cb_barber_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     else:
         logger.info("Rejected #%d %s", bid, booking["slot_key"])
+        _db_log_event("rejected", booking["slot_key"], booking.get("user_id"))
         updated_text = status_text + "\n\n❌ <b>Отклонено</b>"
         cust_text = STRINGS[cust_lang]["rejected"].format(
             date=booking["date_str"], time=booking["time_range"]
@@ -1607,6 +1634,7 @@ async def cb_barber_cancel_booking(
     _cancel_barber_reminder(context.application, slot_key)
     cust_lang = booking.get("user_lang", "ru")
     logger.info("Barber cancelled: %s (%s)", slot_key, booking["name"])
+    _db_log_event("cancelled_barber", slot_key, booking.get("user_id"))
 
     try:
         await query.get_bot().send_message(
@@ -2021,20 +2049,40 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz=TZ)
     today = now.date()
 
-    # Collect all bookings with metadata
+    # ── Load data ────────────────────────────────────────────────────────────
     all_bookings: list[dict[str, Any]] = []
+    log_events: list[tuple[str, str, str | None, int | None]] = []  # (ts, event, slot, uid)
     with sqlite3.connect(_DB_FILE) as conn:
         for row in conn.execute("SELECT slot_key, data FROM bookings"):
             bk = json.loads(row[1])
             bk["_slot_key"] = row[0]
             all_bookings.append(bk)
         total_customers = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+        for row in conn.execute("SELECT ts, event, slot_key, user_id FROM booking_log"):
+            log_events.append((row[0], row[1], row[2], row[3]))
 
-    if not all_bookings:
-        await update.message.reply_text("📊 Пока нет записей для статистики.")
-        return
+    # ── Event counters from log ──────────────────────────────────────────────
+    evt_counter: Counter = Counter()
+    log_users_by_date: dict[str, set[int]] = {}
+    for ts, event, _sk, uid in log_events:
+        evt_counter[event] += 1
+        if uid:
+            try:
+                d_str = datetime.fromisoformat(ts).date().isoformat()
+            except (ValueError, TypeError):
+                continue
+            log_users_by_date.setdefault(d_str, set()).add(uid)
 
-    # ── DAU / MAU / unique clients ───────────────────────────────────────────
+    n_created    = evt_counter.get("created", 0)
+    n_approved   = evt_counter.get("approved", 0)
+    n_rejected   = evt_counter.get("rejected", 0)
+    n_cancel_b   = evt_counter.get("cancelled_barber", 0)
+    n_cancel_u   = evt_counter.get("cancelled_user", 0)
+    n_timeout    = evt_counter.get("timeout", 0)
+    n_rescheduled = evt_counter.get("rescheduled", 0)
+    n_cancelled_total = n_cancel_b + n_cancel_u + n_rejected + n_timeout
+
+    # ── DAU / WAU / MAU from bookings + log ──────────────────────────────────
     users_by_date: dict[str, set[int]] = {}
     svc_counter: Counter = Counter()
     hour_counter: Counter = Counter()
@@ -2070,29 +2118,26 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except ValueError:
             pass
 
-    # DAU = unique users who booked today
+    # Merge log users into users_by_date for DAU/WAU/MAU
+    for d_str, uids in log_users_by_date.items():
+        users_by_date.setdefault(d_str, set()).update(uids)
+        unique_users.update(uids)
+
     dau = len(users_by_date.get(today.isoformat(), set()))
 
-    # MAU = unique users who booked in the last 30 days
     mau_users: set[int] = set()
-    for d_str, uids in users_by_date.items():
-        try:
-            d = date.fromisoformat(d_str)
-        except ValueError:
-            continue
-        if (today - d).days <= 30:
-            mau_users.update(uids)
-    mau = len(mau_users)
-
-    # WAU = last 7 days
     wau_users: set[int] = set()
     for d_str, uids in users_by_date.items():
         try:
             d = date.fromisoformat(d_str)
         except ValueError:
             continue
-        if (today - d).days <= 7:
+        days_ago = (today - d).days
+        if days_ago <= 30:
+            mau_users.update(uids)
+        if days_ago <= 7:
             wau_users.update(uids)
+    mau = len(mau_users)
     wau = len(wau_users)
 
     # ── Top services ─────────────────────────────────────────────────────────
@@ -2130,6 +2175,21 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         and bk["_slot_key"] < (week_start + timedelta(days=7)).isoformat()
     )
 
+    # ── Conversion funnel (from log) ─────────────────────────────────────────
+    funnel = ""
+    if n_created > 0:
+        approve_rate = round(n_approved / n_created * 100) if n_created else 0
+        funnel = (
+            f"\n📈 <b>Воронка</b> (с момента логирования)\n"
+            f"  Заявок создано: <b>{n_created}</b>\n"
+            f"  Одобрено: <b>{n_approved}</b> ({approve_rate}%)\n"
+            f"  Отклонено: <b>{n_rejected}</b>\n"
+            f"  Отменено клиентом: <b>{n_cancel_u}</b>\n"
+            f"  Отменено мастером: <b>{n_cancel_b}</b>\n"
+            f"  Истекло (таймаут): <b>{n_timeout}</b>\n"
+            f"  Перенесено: <b>{n_rescheduled}</b>\n"
+        )
+
     text = (
         f"📊 <b>Статистика</b>\n\n"
         f"👥 <b>Клиенты</b>\n"
@@ -2141,7 +2201,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 <b>Записи</b>\n"
         f"  Сегодня: <b>{bookings_today}</b>\n"
         f"  Эта неделя: <b>{bookings_week}</b>\n"
-        f"  Всего: <b>{len(all_bookings)}</b>\n\n"
+        f"  Всего подтверждённых: <b>{len(all_bookings)}</b>\n"
+        f"  Всего отменённых: <b>{n_cancelled_total}</b>\n"
+        f"{funnel}\n"
         f"✂️ <b>Популярные услуги</b>\n{svc_text}\n\n"
         f"🕐 <b>Пиковые часы</b>\n  {peak_text}\n\n"
         f"📆 <b>Загрузка по дням</b>\n{wd_text}\n\n"
@@ -2244,6 +2306,7 @@ async def _pending_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     _db_delete_pending(bid)
     cust_lang = bk.get("user_lang", "ru")
     logger.info("Pending #%d auto-timed-out: %s", bid, bk["slot_key"])
+    _db_log_event("timeout", bk["slot_key"], bk.get("user_id"))
 
     try:
         await context.bot.send_message(
@@ -2356,6 +2419,7 @@ async def cb_user_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         _db_delete_booking(slot_key)
         _cancel_reminder(context.application, slot_key)
         _cancel_barber_reminder(context.application, slot_key)
+        _db_log_event("cancelled_user", slot_key, uid)
         await _send_to_all_barbers(
             query.get_bot(),
             text=STRINGS["ru"]["cancelled_by_user_barber"].format(
@@ -2374,6 +2438,7 @@ async def cb_user_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pending_bookings.pop(bid)
             _db_delete_pending(bid)
             _cancel_pending_timeout(context.application, bid)
+            _db_log_event("cancelled_user", slot_key, uid)
             await _send_to_all_barbers(
                 query.get_bot(),
                 text=STRINGS["ru"]["cancelled_by_user_barber"].format(
@@ -2569,6 +2634,7 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
 
     logger.info("Reschedule #%d: %s → %s (%s)", bid, old_slot, new_slot, old_bk["name"])
+    _db_log_event("rescheduled", old_slot, old_bk.get("user_id"), {"new_slot": new_slot})
 
     old_date_str = old_bk.get("date_str", old_slot.split()[0])
     old_time_str = old_bk.get("time_range", old_slot.split()[1])
