@@ -28,6 +28,7 @@ import math
 import os
 import re
 import sqlite3
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -2010,6 +2011,146 @@ async def cb_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
 
+# ─────────────────────────── /stats — barber analytics ───────────────────────
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_barber(update.effective_user.id):
+        await update.message.reply_text("Эта команда только для мастера.")
+        return
+
+    now = datetime.now(tz=TZ)
+    today = now.date()
+
+    # Collect all bookings with metadata
+    all_bookings: list[dict[str, Any]] = []
+    with sqlite3.connect(_DB_FILE) as conn:
+        for row in conn.execute("SELECT slot_key, data FROM bookings"):
+            bk = json.loads(row[1])
+            bk["_slot_key"] = row[0]
+            all_bookings.append(bk)
+        total_customers = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+
+    if not all_bookings:
+        await update.message.reply_text("📊 Пока нет записей для статистики.")
+        return
+
+    # ── DAU / MAU / unique clients ───────────────────────────────────────────
+    users_by_date: dict[str, set[int]] = {}
+    svc_counter: Counter = Counter()
+    hour_counter: Counter = Counter()
+    weekday_counter: Counter = Counter()
+    total_revenue = 0
+    unique_users: set[int] = set()
+
+    for bk in all_bookings:
+        uid = bk.get("user_id", 0)
+        unique_users.add(uid)
+
+        booked_at = bk.get("booked_at", "")
+        if booked_at:
+            try:
+                ba_date = datetime.fromisoformat(booked_at).date().isoformat()
+            except (ValueError, TypeError):
+                ba_date = bk["_slot_key"].split()[0]
+        else:
+            ba_date = bk["_slot_key"].split()[0]
+
+        users_by_date.setdefault(ba_date, set()).add(uid)
+
+        for s in bk.get("services", []):
+            svc_counter[s] += 1
+        total_revenue += bk.get("total_price", 0)
+
+        slot_time = bk["_slot_key"].split()[1]
+        hour_counter[int(slot_time.split(":")[0])] += 1
+
+        try:
+            slot_date = datetime.strptime(bk["_slot_key"].split()[0], "%Y-%m-%d")
+            weekday_counter[slot_date.weekday()] += 1
+        except ValueError:
+            pass
+
+    # DAU = unique users who booked today
+    dau = len(users_by_date.get(today.isoformat(), set()))
+
+    # MAU = unique users who booked in the last 30 days
+    mau_users: set[int] = set()
+    for d_str, uids in users_by_date.items():
+        try:
+            d = date.fromisoformat(d_str)
+        except ValueError:
+            continue
+        if (today - d).days <= 30:
+            mau_users.update(uids)
+    mau = len(mau_users)
+
+    # WAU = last 7 days
+    wau_users: set[int] = set()
+    for d_str, uids in users_by_date.items():
+        try:
+            d = date.fromisoformat(d_str)
+        except ValueError:
+            continue
+        if (today - d).days <= 7:
+            wau_users.update(uids)
+    wau = len(wau_users)
+
+    # ── Top services ─────────────────────────────────────────────────────────
+    svc_lines = []
+    for sid, cnt in svc_counter.most_common(5):
+        label = SERVICES.get(sid, {}).get("ru", sid)
+        svc_lines.append(f"  {label} — {cnt}")
+    svc_text = "\n".join(svc_lines) if svc_lines else "  —"
+
+    # ── Peak hours ───────────────────────────────────────────────────────────
+    peak_hours = hour_counter.most_common(3)
+    peak_text = ", ".join(f"{h}:00 ({c})" for h, c in peak_hours)
+
+    # ── Weekday load ─────────────────────────────────────────────────────────
+    wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    wd_parts = []
+    for wd in range(7):
+        c = weekday_counter.get(wd, 0)
+        if c > 0:
+            bar = "▓" * min(c, 20)
+            wd_parts.append(f"  {wd_names[wd]}  {bar} {c}")
+    wd_text = "\n".join(wd_parts) if wd_parts else "  —"
+
+    # ── Revenue ──────────────────────────────────────────────────────────────
+    rev_text = f"{total_revenue:,}".replace(",", " ") + " сум" if total_revenue else "нет данных"
+
+    # ── Bookings today / this week / total ───────────────────────────────────
+    bookings_today = sum(
+        1 for bk in all_bookings if bk["_slot_key"].startswith(today.isoformat())
+    )
+    week_start = today - timedelta(days=today.weekday())
+    bookings_week = sum(
+        1 for bk in all_bookings
+        if bk["_slot_key"] >= week_start.isoformat()
+        and bk["_slot_key"] < (week_start + timedelta(days=7)).isoformat()
+    )
+
+    text = (
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 <b>Клиенты</b>\n"
+        f"  Всего зарегистрировано: <b>{total_customers}</b>\n"
+        f"  Уникальных записавшихся: <b>{len(unique_users)}</b>\n"
+        f"  DAU (сегодня): <b>{dau}</b>\n"
+        f"  WAU (7 дней): <b>{wau}</b>\n"
+        f"  MAU (30 дней): <b>{mau}</b>\n\n"
+        f"📅 <b>Записи</b>\n"
+        f"  Сегодня: <b>{bookings_today}</b>\n"
+        f"  Эта неделя: <b>{bookings_week}</b>\n"
+        f"  Всего: <b>{len(all_bookings)}</b>\n\n"
+        f"✂️ <b>Популярные услуги</b>\n{svc_text}\n\n"
+        f"🕐 <b>Пиковые часы</b>\n  {peak_text}\n\n"
+        f"📆 <b>Загрузка по дням</b>\n{wd_text}\n\n"
+        f"💰 <b>Выручка</b>\n  {rev_text}"
+    )
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 # ─────────────────────────── 30-min reminder job ─────────────────────────────
 
 async def _send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2635,6 +2776,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("bookings", "📋 Today's schedule / Сегодня"),
         BotCommand("week",     "🗓 Weekly schedule / Неделя"),
         BotCommand("config",   "⚙️ Working hours / Рабочее время"),
+        BotCommand("stats",    "📊 Statistics / Статистика"),
     ]
 
     # Default menu for all customers
@@ -2718,6 +2860,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("week",      cmd_week))
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("config",    cmd_config))
+    app.add_handler(CommandHandler("stats",     cmd_stats))
     app.add_handler(CommandHandler("mybooking", cmd_mybooking))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("info",      cmd_info))
