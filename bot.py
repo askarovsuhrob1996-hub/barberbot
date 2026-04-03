@@ -2838,11 +2838,14 @@ async def _post_init(app: Application) -> None:
         BotCommand("settings",   "⚙️ Language / Язык / Til"),
         BotCommand("help",       "ℹ️ Help / Помощь / Yordam"),
     ]
-    barber_commands = customer_commands + [
-        BotCommand("bookings", "📋 Today's schedule / Сегодня"),
-        BotCommand("week",     "🗓 Weekly schedule / Неделя"),
-        BotCommand("config",   "⚙️ Working hours / Рабочее время"),
-        BotCommand("stats",    "📊 Statistics / Статистика"),
+    barber_commands = [
+        BotCommand("start",    "✂️ Записать клиента"),
+        BotCommand("bookings", "📋 Записи на сегодня"),
+        BotCommand("week",     "🗓 Расписание на неделю"),
+        BotCommand("stats",    "📊 Статистика"),
+        BotCommand("config",   "⚙️ Рабочие часы"),
+        BotCommand("mybooking","📋 Моя запись"),
+        BotCommand("help",     "ℹ️ Помощь"),
     ]
 
     # Default menu for all customers
