@@ -2089,10 +2089,12 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     weekday_counter: Counter = Counter()
     total_revenue = 0
     unique_users: set[int] = set()
+    user_visits: Counter = Counter()
 
     for bk in all_bookings:
         uid = bk.get("user_id", 0)
         unique_users.add(uid)
+        user_visits[uid] += 1
 
         booked_at = bk.get("booked_at", "")
         if booked_at:
@@ -2195,6 +2197,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"👥 <b>Клиенты</b>\n"
         f"  Всего зарегистрировано: <b>{total_customers}</b>\n"
         f"  Уникальных записавшихся: <b>{len(unique_users)}</b>\n"
+        f"  Записались повторно: <b>{sum(1 for c in user_visits.values() if c > 1)}</b>\n"
         f"  DAU (сегодня): <b>{dau}</b>\n"
         f"  WAU (7 дней): <b>{wau}</b>\n"
         f"  MAU (30 дней): <b>{mau}</b>\n\n"
