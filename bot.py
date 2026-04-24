@@ -372,7 +372,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "min_one_svc":          "Пожалуйста, выберите хотя бы одну услугу.",
         "svc_dur_min":          "мин",
         "no_consec":            (
-            "😕 К сожалению, для выбранных услуг нужно <b>{n} ч.</b> подряд, "
+            "😕 К сожалению, для выбранных услуг нужно <b>{n} мин.</b> подряд, "
             "а этого времени уже нет в этот день.\n\n"
             "Выберите другое время:"
         ),
@@ -563,7 +563,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "min_one_svc":          "Iltimos, kamida bitta xizmat tanlang.",
         "svc_dur_min":          "daq",
         "no_consec":            (
-            "😕 Afsuski, tanlangan xizmatlar uchun <b>{n} soat</b> ketma-ket bo'sh vaqt kerak, "
+            "😕 Afsuski, tanlangan xizmatlar uchun <b>{n} daqiqa</b> ketma-ket bo'sh vaqt kerak, "
             "lekin bu kunda bunday vaqt qolmadi.\n\n"
             "Boshqa vaqt tanlang:"
         ),
@@ -1357,7 +1357,7 @@ async def cb_service_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         if not _can_fit(d, t, n_slots, allow_overflow=True):
             await query.edit_message_text(
-                tx(uid, "no_consec", n=n_slots),
+                tx(uid, "no_consec", n=total_mins),
                 parse_mode="HTML",
                 reply_markup=_time_keyboard(d, lang),
             )
