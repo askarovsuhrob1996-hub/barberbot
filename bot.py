@@ -2042,17 +2042,82 @@ async def cb_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─────────────────────────── /stats — barber analytics ───────────────────────
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_barber(update.effective_user.id):
-        await update.message.reply_text("Эта команда только для мастера.")
-        return
+_STATS_PRESETS = [
+    ("today",      "Сегодня"),
+    ("yesterday",  "Вчера"),
+    ("week",       "Эта неделя"),
+    ("last_week",  "Прошлая неделя"),
+    ("month",      "Этот месяц"),
+    ("last_month", "Прошлый месяц"),
+    ("year",       "Год"),
+    ("all",        "Всё время"),
+]
 
-    now = datetime.now(tz=TZ)
-    today = now.date()
 
-    # ── Load data ────────────────────────────────────────────────────────────
+def _stats_period_range(code: str, today: date) -> tuple[date, date, str]:
+    """Return (start, end, label) for a named period code."""
+    week_start  = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+    last_month_end   = month_start - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+    if code == "today":
+        return today, today, "Сегодня"
+    if code == "yesterday":
+        d = today - timedelta(days=1)
+        return d, d, "Вчера"
+    if code == "week":
+        return week_start, today, "Эта неделя"
+    if code == "last_week":
+        return week_start - timedelta(days=7), week_start - timedelta(days=1), "Прошлая неделя"
+    if code == "month":
+        return month_start, today, "Этот месяц"
+    if code == "last_month":
+        return last_month_start, last_month_end, "Прошлый месяц"
+    if code == "year":
+        return today.replace(month=1, day=1), today, "Год"
+    return date(2000, 1, 1), today, "Всё время"
+
+
+def _calc_cash_in_range(bookings: list[dict[str, Any]], today: date,
+                        start_d: date, end_d: date) -> tuple[int, int]:
+    """Sum total_price and count visits with start_d ≤ slot_date ≤ min(end_d, today)."""
+    end_d = min(end_d, today)
+    if start_d > end_d:
+        return 0, 0
+    total = visits = 0
+    for bk in bookings:
+        try:
+            sd = date.fromisoformat(bk["_slot_key"].split()[0])
+        except (ValueError, KeyError):
+            continue
+        if start_d <= sd <= end_d:
+            price = bk.get("total_price")
+            if price is None:
+                price = _calc_total_price(bk.get("services", []))
+            total  += price
+            visits += 1
+    return total, visits
+
+
+def _stats_keyboard(active: str) -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(_STATS_PRESETS), 2):
+        row = []
+        for code, label in _STATS_PRESETS[i:i + 2]:
+            mark = "• " if code == active else ""
+            row.append(InlineKeyboardButton(f"{mark}{label}",
+                                            callback_data=f"stats_p_{code}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("📅 Свой период",
+                                      callback_data="stats_p_custom")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_stats_text(start_d: date, end_d: date, period_label: str) -> str:
+    today = datetime.now(tz=TZ).date()
+
     all_bookings: list[dict[str, Any]] = []
-    log_events: list[tuple[str, str, str | None, int | None]] = []  # (ts, event, slot, uid)
+    log_events: list[tuple[str, str, str | None, int | None]] = []
     with sqlite3.connect(_DB_FILE) as conn:
         for row in conn.execute("SELECT slot_key, data FROM bookings"):
             bk = json.loads(row[1])
@@ -2062,7 +2127,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for row in conn.execute("SELECT ts, event, slot_key, user_id FROM booking_log"):
             log_events.append((row[0], row[1], row[2], row[3]))
 
-    # ── Event counters from log ──────────────────────────────────────────────
     evt_counter: Counter = Counter()
     log_users_by_date: dict[str, set[int]] = {}
     for ts, event, _sk, uid in log_events:
@@ -2074,28 +2138,21 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             log_users_by_date.setdefault(d_str, set()).add(uid)
 
-    n_created    = evt_counter.get("created", 0)
-    n_approved   = evt_counter.get("approved", 0)
-    n_rejected   = evt_counter.get("rejected", 0)
-    n_cancel_b   = evt_counter.get("cancelled_barber", 0)
-    n_cancel_u   = evt_counter.get("cancelled_user", 0)
-    n_timeout    = evt_counter.get("timeout", 0)
+    n_created     = evt_counter.get("created", 0)
+    n_approved    = evt_counter.get("approved", 0)
+    n_rejected    = evt_counter.get("rejected", 0)
+    n_cancel_b    = evt_counter.get("cancelled_barber", 0)
+    n_cancel_u    = evt_counter.get("cancelled_user", 0)
+    n_timeout     = evt_counter.get("timeout", 0)
     n_rescheduled = evt_counter.get("rescheduled", 0)
     n_cancelled_total = n_cancel_b + n_cancel_u + n_rejected + n_timeout
 
-    # ── DAU / WAU / MAU from bookings + log ──────────────────────────────────
     users_by_date: dict[str, set[int]] = {}
     svc_counter: Counter = Counter()
     hour_counter: Counter = Counter()
     weekday_counter: Counter = Counter()
     unique_users: set[int] = set()
     user_visits: Counter = Counter()
-
-    # Cash: completed visits only (slot_date ≤ today)
-    week_start  = today - timedelta(days=today.weekday())
-    month_start = today.replace(day=1)
-    cash_today = cash_week = cash_month = cash_total = 0
-    visits_today = visits_week = visits_month = visits_total = 0
 
     for bk in all_bookings:
         uid = bk.get("user_id", 0)
@@ -2110,44 +2167,23 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 ba_date = bk["_slot_key"].split()[0]
         else:
             ba_date = bk["_slot_key"].split()[0]
-
         users_by_date.setdefault(ba_date, set()).add(uid)
 
         for s in bk.get("services", []):
             svc_counter[s] += 1
-
         slot_time = bk["_slot_key"].split()[1]
         hour_counter[int(slot_time.split(":")[0])] += 1
-
         try:
             slot_date = date.fromisoformat(bk["_slot_key"].split()[0])
+            weekday_counter[slot_date.weekday()] += 1
         except ValueError:
-            continue
-        weekday_counter[slot_date.weekday()] += 1
+            pass
 
-        if slot_date <= today:
-            price = bk.get("total_price")
-            if price is None:
-                price = _calc_total_price(bk.get("services", []))
-            cash_total   += price
-            visits_total += 1
-            if slot_date >= month_start:
-                cash_month   += price
-                visits_month += 1
-            if slot_date >= week_start:
-                cash_week   += price
-                visits_week += 1
-            if slot_date == today:
-                cash_today   += price
-                visits_today += 1
-
-    # Merge log users into users_by_date for DAU/WAU/MAU
     for d_str, uids in log_users_by_date.items():
         users_by_date.setdefault(d_str, set()).update(uids)
         unique_users.update(uids)
 
     dau = len(users_by_date.get(today.isoformat(), set()))
-
     mau_users: set[int] = set()
     wau_users: set[int] = set()
     for d_str, uids in users_by_date.items():
@@ -2160,21 +2196,17 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             mau_users.update(uids)
         if days_ago <= 7:
             wau_users.update(uids)
-    mau = len(mau_users)
-    wau = len(wau_users)
+    mau, wau = len(mau_users), len(wau_users)
 
-    # ── Top services ─────────────────────────────────────────────────────────
     svc_lines = []
     for sid, cnt in svc_counter.most_common(5):
         label = SERVICES.get(sid, {}).get("ru", sid)
         svc_lines.append(f"  {label} — {cnt}")
     svc_text = "\n".join(svc_lines) if svc_lines else "  —"
 
-    # ── Peak hours ───────────────────────────────────────────────────────────
     peak_hours = hour_counter.most_common(3)
     peak_text = ", ".join(f"{h}:00 ({c})" for h, c in peak_hours)
 
-    # ── Weekday load ─────────────────────────────────────────────────────────
     wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     wd_parts = []
     for wd in range(7):
@@ -2184,20 +2216,23 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             wd_parts.append(f"  {wd_names[wd]}  {bar} {c}")
     wd_text = "\n".join(wd_parts) if wd_parts else "  —"
 
-    # ── Cash (revenue, completed visits only) ────────────────────────────────
-    def _fmt_sum(n: int) -> str:
-        return f"{n:,}".replace(",", " ") + " сум"
-
-    avg_check = (cash_total // visits_total) if visits_total else 0
+    # Cash for the selected period
+    cash_sum, cash_visits = _calc_cash_in_range(all_bookings, today, start_d, end_d)
+    avg_check = (cash_sum // cash_visits) if cash_visits else 0
+    fmt = lambda n: f"{n:,}".replace(",", " ") + " сум"
+    eff_end = min(end_d, today)
+    if start_d == eff_end:
+        date_range = start_d.strftime("%d.%m.%Y")
+    else:
+        date_range = f"{start_d.strftime('%d.%m.%Y')} — {eff_end.strftime('%d.%m.%Y')}"
     cash_text = (
-        f"  Сегодня: <b>{_fmt_sum(cash_today)}</b> ({visits_today} визитов)\n"
-        f"  Эта неделя: <b>{_fmt_sum(cash_week)}</b> ({visits_week})\n"
-        f"  Этот месяц: <b>{_fmt_sum(cash_month)}</b> ({visits_month})\n"
-        f"  Всего: <b>{_fmt_sum(cash_total)}</b> ({visits_total})\n"
-        f"  Средний чек: <b>{_fmt_sum(avg_check)}</b>"
+        f"  Период: <i>{date_range}</i>\n"
+        f"  Сумма: <b>{fmt(cash_sum)}</b>\n"
+        f"  Визитов: <b>{cash_visits}</b>\n"
+        f"  Средний чек: <b>{fmt(avg_check)}</b>"
     )
 
-    # ── Bookings today / this week / total ───────────────────────────────────
+    week_start = today - timedelta(days=today.weekday())
     bookings_today = sum(
         1 for bk in all_bookings if bk["_slot_key"].startswith(today.isoformat())
     )
@@ -2207,7 +2242,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         and bk["_slot_key"] < (week_start + timedelta(days=7)).isoformat()
     )
 
-    # ── Conversion funnel (from log) ─────────────────────────────────────────
     funnel = ""
     if n_created > 0:
         approve_rate = round(n_approved / n_created * 100) if n_created else 0
@@ -2222,7 +2256,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"  Перенесено: <b>{n_rescheduled}</b>\n"
         )
 
-    text = (
+    return (
         f"📊 <b>Статистика</b>\n\n"
         f"👥 <b>Клиенты</b>\n"
         f"  Всего зарегистрировано: <b>{total_customers}</b>\n"
@@ -2240,10 +2274,82 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"✂️ <b>Популярные услуги</b>\n{svc_text}\n\n"
         f"🕐 <b>Пиковые часы</b>\n  {peak_text}\n\n"
         f"📆 <b>Загрузка по дням</b>\n{wd_text}\n\n"
-        f"💰 <b>Касса</b> (по факту визитов)\n{cash_text}"
+        f"💰 <b>Касса</b> — {period_label}\n{cash_text}"
     )
 
-    await update.message.reply_text(text, parse_mode="HTML")
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_barber(update.effective_user.id):
+        await update.message.reply_text("Эта команда только для мастера.")
+        return
+    context.user_data.pop("stats_awaiting_range", None)
+    today = datetime.now(tz=TZ).date()
+    start_d, end_d, label = _stats_period_range("all", today)
+    text = _build_stats_text(start_d, end_d, label)
+    await update.message.reply_text(text, parse_mode="HTML",
+                                    reply_markup=_stats_keyboard("all"))
+
+
+async def cb_stats_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_barber(update.effective_user.id):
+        await query.answer("Только для мастера.", show_alert=True)
+        return
+    await query.answer()
+    code = query.data[len("stats_p_"):]
+    if code == "custom":
+        context.user_data["stats_awaiting_range"] = True
+        await query.message.reply_text(
+            "📅 Отправьте диапазон в формате\n<code>2026-05-01 2026-05-31</code>\n\n"
+            "Или /cancel чтобы отменить.",
+            parse_mode="HTML",
+        )
+        return
+    today = datetime.now(tz=TZ).date()
+    start_d, end_d, label = _stats_period_range(code, today)
+    text = _build_stats_text(start_d, end_d, label)
+    try:
+        await query.edit_message_text(text, parse_mode="HTML",
+                                      reply_markup=_stats_keyboard(code))
+    except Exception as exc:
+        # "message is not modified" when same period clicked twice — ignore
+        if "not modified" not in str(exc).lower():
+            logger.warning("stats edit failed: %s", exc)
+
+
+async def on_stats_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get("stats_awaiting_range"):
+        return
+    if not _is_barber(update.effective_user.id):
+        return
+    raw = (update.message.text or "").strip()
+    if raw.lower() in ("/cancel", "cancel", "отмена"):
+        context.user_data.pop("stats_awaiting_range", None)
+        await update.message.reply_text("Отменено.")
+        return
+    parts = raw.replace(",", " ").replace("…", " ").replace("—", " ").split()
+    if len(parts) != 2:
+        await update.message.reply_text(
+            "❌ Неверный формат. Пример: <code>2026-05-01 2026-05-31</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        start_d = date.fromisoformat(parts[0])
+        end_d   = date.fromisoformat(parts[1])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Не понял даты. Пример: <code>2026-05-01 2026-05-31</code>",
+            parse_mode="HTML",
+        )
+        return
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+    context.user_data.pop("stats_awaiting_range", None)
+    label = f"{start_d.strftime('%d.%m.%Y')} — {end_d.strftime('%d.%m.%Y')}"
+    text = _build_stats_text(start_d, end_d, label)
+    await update.message.reply_text(text, parse_mode="HTML",
+                                    reply_markup=_stats_keyboard("custom"))
 
 
 # ─────────────────────────── 30-min reminder job ─────────────────────────────
@@ -2993,6 +3099,10 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(cb_config, pattern=r"^cfg_"))
     app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(),
                                           pattern=r"^noop$"))
+    # /stats period picker (must come after ConversationHandler)
+    app.add_handler(CallbackQueryHandler(cb_stats_period, pattern=r"^stats_p_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                    on_stats_custom_text), group=1)
 
     return app
 
