@@ -1446,6 +1446,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "date_str":       date_str,
         "time":           t,
         "booked_at":      datetime.now(tz=TZ).isoformat(),
+        "total_price":    _calc_total_price(services),
     }
     logger.info("Pending #%d: %s → %s (%d slots)", bid, slot_key, name, n_slots)
     customer_cache.setdefault(uid, {}).update(name=name, phone=phone)
@@ -2087,9 +2088,14 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     svc_counter: Counter = Counter()
     hour_counter: Counter = Counter()
     weekday_counter: Counter = Counter()
-    total_revenue = 0
     unique_users: set[int] = set()
     user_visits: Counter = Counter()
+
+    # Cash: completed visits only (slot_date ≤ today)
+    week_start  = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+    cash_today = cash_week = cash_month = cash_total = 0
+    visits_today = visits_week = visits_month = visits_total = 0
 
     for bk in all_bookings:
         uid = bk.get("user_id", 0)
@@ -2109,16 +2115,31 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         for s in bk.get("services", []):
             svc_counter[s] += 1
-        total_revenue += bk.get("total_price", 0)
 
         slot_time = bk["_slot_key"].split()[1]
         hour_counter[int(slot_time.split(":")[0])] += 1
 
         try:
-            slot_date = datetime.strptime(bk["_slot_key"].split()[0], "%Y-%m-%d")
-            weekday_counter[slot_date.weekday()] += 1
+            slot_date = date.fromisoformat(bk["_slot_key"].split()[0])
         except ValueError:
-            pass
+            continue
+        weekday_counter[slot_date.weekday()] += 1
+
+        if slot_date <= today:
+            price = bk.get("total_price")
+            if price is None:
+                price = _calc_total_price(bk.get("services", []))
+            cash_total   += price
+            visits_total += 1
+            if slot_date >= month_start:
+                cash_month   += price
+                visits_month += 1
+            if slot_date >= week_start:
+                cash_week   += price
+                visits_week += 1
+            if slot_date == today:
+                cash_today   += price
+                visits_today += 1
 
     # Merge log users into users_by_date for DAU/WAU/MAU
     for d_str, uids in log_users_by_date.items():
@@ -2163,14 +2184,23 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             wd_parts.append(f"  {wd_names[wd]}  {bar} {c}")
     wd_text = "\n".join(wd_parts) if wd_parts else "  —"
 
-    # ── Revenue ──────────────────────────────────────────────────────────────
-    rev_text = f"{total_revenue:,}".replace(",", " ") + " сум" if total_revenue else "нет данных"
+    # ── Cash (revenue, completed visits only) ────────────────────────────────
+    def _fmt_sum(n: int) -> str:
+        return f"{n:,}".replace(",", " ") + " сум"
+
+    avg_check = (cash_total // visits_total) if visits_total else 0
+    cash_text = (
+        f"  Сегодня: <b>{_fmt_sum(cash_today)}</b> ({visits_today} визитов)\n"
+        f"  Эта неделя: <b>{_fmt_sum(cash_week)}</b> ({visits_week})\n"
+        f"  Этот месяц: <b>{_fmt_sum(cash_month)}</b> ({visits_month})\n"
+        f"  Всего: <b>{_fmt_sum(cash_total)}</b> ({visits_total})\n"
+        f"  Средний чек: <b>{_fmt_sum(avg_check)}</b>"
+    )
 
     # ── Bookings today / this week / total ───────────────────────────────────
     bookings_today = sum(
         1 for bk in all_bookings if bk["_slot_key"].startswith(today.isoformat())
     )
-    week_start = today - timedelta(days=today.weekday())
     bookings_week = sum(
         1 for bk in all_bookings
         if bk["_slot_key"] >= week_start.isoformat()
@@ -2210,7 +2240,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"✂️ <b>Популярные услуги</b>\n{svc_text}\n\n"
         f"🕐 <b>Пиковые часы</b>\n  {peak_text}\n\n"
         f"📆 <b>Загрузка по дням</b>\n{wd_text}\n\n"
-        f"💰 <b>Выручка</b>\n  {rev_text}"
+        f"💰 <b>Касса</b> (по факту визитов)\n{cash_text}"
     )
 
     await update.message.reply_text(text, parse_mode="HTML")
