@@ -443,6 +443,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "mybooking_header":     "📋 <b>Ваша запись:</b>\n\n",
         "mybooking_pending":    "⏳ Ожидает подтверждения мастера",
         "mybooking_confirmed":  "✅ Подтверждена",
+        "my_title":             "📋 <b>Мои записи</b>",
+        "my_upcoming":          "🔜 <b>Предстоящие</b>",
+        "my_upcoming_none":     "🔜 <b>Предстоящие</b>\n  Нет активных записей. Записаться — /start",
+        "my_history":           "🕓 <b>История</b>",
+        "my_history_none":      "🕓 <b>История</b>\n  Пока нет завершённых визитов.",
+        "my_history_more":      "  …и ещё {n}",
+        "my_total":             "📊 Всего визитов: <b>{n}</b> · последний {date}",
+        "my_manage_hint":       "Управлять записью (перенос/отмена): /mybooking",
         "btn_cancel_booking":   "❌ Отменить запись",
         "cancelled_by_user":    "✅ Запись отменена. Будем рады видеть вас снова — /start",
         "cancelled_by_user_barber": (
@@ -634,6 +642,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "mybooking_header":     "📋 <b>Yozilishingiz:</b>\n\n",
         "mybooking_pending":    "⏳ Usta tasdig'ini kutmoqda",
         "mybooking_confirmed":  "✅ Tasdiqlangan",
+        "my_title":             "📋 <b>Mening yozilishlarim</b>",
+        "my_upcoming":          "🔜 <b>Kelgusi</b>",
+        "my_upcoming_none":     "🔜 <b>Kelgusi</b>\n  Faol yozilish yo'q. Yozilish — /start",
+        "my_history":           "🕓 <b>Tarix</b>",
+        "my_history_none":      "🕓 <b>Tarix</b>\n  Hozircha tugatilgan tashriflar yo'q.",
+        "my_history_more":      "  …va yana {n}",
+        "my_total":             "📊 Jami tashriflar: <b>{n}</b> · oxirgisi {date}",
+        "my_manage_hint":       "Yozilishni boshqarish (ko'chirish/bekor): /mybooking",
         "btn_cancel_booking":   "❌ Yozilishni bekor qilish",
         "cancelled_by_user":    "✅ Yozilish bekor qilindi. Yana ko'rishguncha — /start",
         "cancelled_by_user_barber": (
@@ -2495,52 +2511,118 @@ def _schedule_pending_timeout(app, bid: int, when) -> None:
 
 # ─────────────────────────── Customer: /mybooking ────────────────────────────
 
-async def cmd_mybooking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid  = update.effective_user.id
-    lang = _lang(uid)
+_HISTORY_LIMIT = 10   # how many past visits to list
 
-    # Search confirmed appointments
-    found_slot, found_bk, found_status = None, None, None
+
+def _collect_user_bookings(uid: int, today: date):
+    """Return (upcoming, past) for a user.
+
+    upcoming: list of (slot_key, bk, status) sorted ascending by slot_key,
+              status ∈ {"confirmed", "pending"}.
+    past:     list of (slot_key, bk) for confirmed visits with slot_date < today,
+              sorted descending (most recent first).
+    """
+    upcoming: list[tuple[str, dict, str]] = []
+    past: list[tuple[str, dict]] = []
+
     for slot_key, bk in appointments.items():
+        if bk.get("user_id") != uid:
+            continue
+        try:
+            sd = date.fromisoformat(slot_key.split()[0])
+        except (ValueError, IndexError):
+            continue
+        if sd < today:
+            past.append((slot_key, bk))
+        else:
+            upcoming.append((slot_key, bk, "confirmed"))
+
+    for bk in pending_bookings.values():
         if bk.get("user_id") == uid:
-            found_slot, found_bk, found_status = slot_key, bk, "confirmed"
-            break
+            upcoming.append((bk["slot_key"], bk, "pending"))
 
-    # Then pending
-    if found_slot is None:
-        for bk in pending_bookings.values():
-            if bk.get("user_id") == uid:
-                found_slot  = bk["slot_key"]
-                found_bk    = bk
-                found_status = "pending"
-                break
+    upcoming.sort(key=lambda t: t[0])
+    past.sort(key=lambda t: t[0], reverse=True)
+    return upcoming, past
 
-    if found_slot is None:
+
+def _short_date(slot_key: str) -> str:
+    try:
+        return date.fromisoformat(slot_key.split()[0]).strftime("%d.%m")
+    except (ValueError, IndexError):
+        return slot_key.split()[0]
+
+
+async def cmd_mybooking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid   = update.effective_user.id
+    lang  = _lang(uid)
+    today = datetime.now(tz=TZ).date()
+
+    upcoming, past = _collect_user_bookings(uid, today)
+
+    # Nothing at all → simple prompt
+    if not upcoming and not past:
         await update.message.reply_text(tx(uid, "mybooking_none"))
         return
 
-    status_label = tx(uid, "mybooking_confirmed" if found_status == "confirmed" else "mybooking_pending")
-    svc_text     = ", ".join(_svc_client_label(s, lang) for s in found_bk["services"])
-    dur_unit     = STRINGS[lang]["svc_dur_min"]
+    lines = [tx(uid, "my_title"), ""]
 
-    text = (
-        tx(uid, "mybooking_header") +
-        f"📅 {found_bk.get('date_str', found_slot.split()[0])}\n"
-        f"🕐 {found_bk.get('time_range', found_slot.split()[1])}\n"
-        f"✂️ {svc_text}\n"
-        f"⏱ ~{found_bk.get('duration_mins', 30)} {dur_unit}\n\n"
-        f"{status_label}"
-    )
-    enc = found_slot.replace(" ", "_", 1)
-    if found_status == "confirmed":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(tx(uid, "btn_reschedule"),     callback_data=f"uresch_{enc}")],
-            [InlineKeyboardButton(tx(uid, "btn_cancel_booking"), callback_data=f"ucancel_{enc}")],
-        ])
+    # ── Upcoming ──────────────────────────────────────────────────────────────
+    if upcoming:
+        lines.append(tx(uid, "my_upcoming"))
+        for slot_key, bk, status in upcoming:
+            svc_text = ", ".join(_svc_client_label(s, lang) for s in bk.get("services", []))
+            mark = "✅" if status == "confirmed" else "⏳"
+            status_label = tx(uid, "mybooking_confirmed" if status == "confirmed"
+                              else "mybooking_pending")
+            lines.append(
+                f"  {mark} {bk.get('date_str', slot_key.split()[0])}, "
+                f"{bk.get('time_range', slot_key.split()[1])}\n"
+                f"     ✂️ {svc_text}\n"
+                f"     {status_label}"
+            )
     else:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(tx(uid, "btn_cancel_booking"), callback_data=f"ucancel_{enc}")
-        ]])
+        lines.append(tx(uid, "my_upcoming_none"))
+    lines.append("")
+
+    # ── History ───────────────────────────────────────────────────────────────
+    if past:
+        lines.append(tx(uid, "my_history"))
+        for slot_key, bk in past[:_HISTORY_LIMIT]:
+            svc_text = ", ".join(_svc_client_label(s, lang) for s in bk.get("services", []))
+            lines.append(f"  • {_short_date(slot_key)} — {svc_text}")
+        if len(past) > _HISTORY_LIMIT:
+            lines.append(tx(uid, "my_history_more", n=len(past) - _HISTORY_LIMIT))
+        lines.append("")
+        last_date = date.fromisoformat(past[0][0].split()[0]).strftime("%d.%m.%Y")
+        lines.append(tx(uid, "my_total", n=len(past), date=last_date))
+    else:
+        lines.append(tx(uid, "my_history_none"))
+
+    text = "\n".join(lines)
+
+    # ── Management buttons for upcoming bookings ──────────────────────────────
+    multi = len(upcoming) > 1
+    rows: list[list[InlineKeyboardButton]] = []
+    for slot_key, bk, status in upcoming:
+        enc = slot_key.replace(" ", "_", 1)
+        suffix = f" · {_short_date(slot_key)} {slot_key.split()[1]}" if multi else ""
+        if status == "confirmed":
+            rows.append([
+                InlineKeyboardButton(tx(uid, "btn_reschedule") + suffix,
+                                     callback_data=f"uresch_{enc}"),
+            ])
+            rows.append([
+                InlineKeyboardButton(tx(uid, "btn_cancel_booking") + suffix,
+                                     callback_data=f"ucancel_{enc}"),
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(tx(uid, "btn_cancel_booking") + suffix,
+                                     callback_data=f"ucancel_{enc}"),
+            ])
+
+    kb = InlineKeyboardMarkup(rows) if rows else None
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -2973,7 +3055,7 @@ async def _post_init(app: Application) -> None:
 
     customer_commands = [
         BotCommand("start",      "📅 Book / Записаться / Yozilish"),
-        BotCommand("mybooking",  "📋 My booking / Моя запись / Mening yozilishim"),
+        BotCommand("mybooking",  "📋 My bookings / Мои записи / Yozilishlarim"),
         BotCommand("settings",   "⚙️ Language / Язык / Til"),
         BotCommand("help",       "ℹ️ Help / Помощь / Yordam"),
     ]
