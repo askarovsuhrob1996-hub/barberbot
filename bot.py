@@ -21,6 +21,7 @@ Customer commands:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import logging.handlers
@@ -359,6 +360,19 @@ STRINGS: dict[str, dict[str, str]] = {
             "Отлично! Время <b>{time}</b> зарезервировано.\n\n"
             "👤 Как вас зовут? Введите ваше имя:"
         ),
+        "enter_client_name":    (
+            "Время <b>{time}</b> выбрано.\n\n"
+            "👤 Введите <b>имя клиента</b>:"
+        ),
+        "enter_client_phone":   (
+            "📞 Введите <b>телефон клиента</b> или нажмите «Пропустить»:"
+        ),
+        "btn_skip":             "⏭ Пропустить",
+        "client_booked":        (
+            "✅ <b>Клиент записан</b>\n\n"
+            "📅 {date}\n🕐 {time}\n👤 {name}\n📞 {phone}\n"
+            "✂️ {svcs}\n⏱ ~{mins} мин.{price}{overflow}"
+        ),
         "invalid_name":         "⚠️ Имя слишком короткое. Пожалуйста, введите полное имя:",
         "enter_phone":          (
             "Приятно познакомиться, <b>{name}</b>! 😊\n\n"
@@ -557,6 +571,19 @@ STRINGS: dict[str, dict[str, str]] = {
         "enter_name":           (
             "Ajoyib! <b>{time}</b> vaqti zahiralandi.\n\n"
             "👤 Ismingiz nima? Iltimos, to'liq ismingizni kiriting:"
+        ),
+        "enter_client_name":    (
+            "<b>{time}</b> vaqti tanlandi.\n\n"
+            "👤 <b>Mijoz ismini</b> kiriting:"
+        ),
+        "enter_client_phone":   (
+            "📞 <b>Mijoz telefonini</b> kiriting yoki «O'tkazib yuborish» bosing:"
+        ),
+        "btn_skip":             "⏭ O'tkazib yuborish",
+        "client_booked":        (
+            "✅ <b>Mijoz yozildi</b>\n\n"
+            "📅 {date}\n🕐 {time}\n👤 {name}\n📞 {phone}\n"
+            "✂️ {svcs}\n⏱ ~{mins} daq.{price}{overflow}"
         ),
         "invalid_name":         "⚠️ Ism juda qisqa. Iltimos, to'liq ismingizni kiriting:",
         "enter_phone":          (
@@ -996,6 +1023,17 @@ def _phone_keyboard(lang: str) -> ReplyKeyboardMarkup:
     )
 
 
+def _barber_phone_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    """Phone step when the barber books a walk-in: type or skip, no share-contact."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(STRINGS[lang]["btn_skip"])],
+            [KeyboardButton(STRINGS[lang]["btn_cancel"])],
+        ],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
 def _approval_keyboard(booking_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Одобрить",  callback_data=f"approve_{booking_id}"),
@@ -1253,8 +1291,13 @@ async def cb_time_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     context.user_data["services"] = set()
 
+    # Barber booking a walk-in → always capture the real client's name/phone,
+    # never reuse the barber's own cached identity.
+    is_barber = _is_barber(uid)
+    context.user_data["barber_booking"] = is_barber
+
     cached = customer_cache.get(uid, {})
-    if "name" in cached and "phone" in cached:
+    if not is_barber and "name" in cached and "phone" in cached:
         context.user_data.update(name=cached["name"], phone=cached["phone"])
         await query.edit_message_text(
             tx(uid, "welcome_back", time=t, name=cached["name"]),
@@ -1263,8 +1306,9 @@ async def cb_time_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return STATE_SERVICES
 
+    prompt = tx(uid, "enter_client_name", time=t) if is_barber else tx(uid, "enter_name", time=t)
     await query.edit_message_text(
-        tx(uid, "enter_name", time=t),
+        prompt,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton(STRINGS[lang]["btn_cancel"], callback_data="cancel"),
@@ -1285,11 +1329,18 @@ async def handle_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return STATE_NAME
 
     context.user_data["name"] = name
-    await update.message.reply_text(
-        tx(uid, "enter_phone", name=name),
-        parse_mode="HTML",
-        reply_markup=_phone_keyboard(lang),
-    )
+    if context.user_data.get("barber_booking"):
+        await update.message.reply_text(
+            tx(uid, "enter_client_phone"),
+            parse_mode="HTML",
+            reply_markup=_barber_phone_keyboard(lang),
+        )
+    else:
+        await update.message.reply_text(
+            tx(uid, "enter_phone", name=name),
+            parse_mode="HTML",
+            reply_markup=_phone_keyboard(lang),
+        )
     return STATE_PHONE
 
 
@@ -1315,6 +1366,11 @@ async def handle_phone_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
+    # Barber may skip the walk-in client's phone
+    if context.user_data.get("barber_booking") and phone in (
+        STRINGS["ru"]["btn_skip"], STRINGS["uz"]["btn_skip"]
+    ):
+        return await _after_phone(update, context, "—")
     if len("".join(c for c in phone if c.isdigit())) < 7:
         await update.message.reply_text(
             tx(uid, "invalid_phone"), reply_markup=_phone_keyboard(lang)
@@ -1418,6 +1474,19 @@ async def cb_service_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ─────────────────────────── STATE_CONFIRM ───────────────────────────────────
 
+def _finalize_confirmed(app, booking: dict) -> None:
+    """Move a booking straight into confirmed appointments.
+
+    Used for barber walk-ins, which don't need a self-approval step.
+    Only the barber reminder is scheduled — the "client" chat is the barber's
+    own, so a separate client reminder would just duplicate it.
+    """
+    appointments[booking["slot_key"]] = booking
+    _db_save_booking(booking["slot_key"], booking)
+    _schedule_barber_reminder(app, booking)
+    _db_log_event("approved", booking["slot_key"], booking.get("user_id"))
+
+
 async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -1446,9 +1515,10 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     overflow = context.user_data.get("overflow_mins", 0)
+    is_barber_booking = context.user_data.get("barber_booking", False)
+    total_price = _calc_total_price(services)
 
-    bid = _next_id()
-    pending_bookings[bid] = {
+    booking = {
         "slot_key":       slot_key,
         "user_id":        uid,
         "user_lang":      lang,
@@ -1462,20 +1532,41 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "date_str":       date_str,
         "time":           t,
         "booked_at":      datetime.now(tz=TZ).isoformat(),
-        "total_price":    _calc_total_price(services),
+        "total_price":    total_price,
     }
+    _db_log_event("created", slot_key, uid,
+                  {"services": services, "duration_mins": total_mins})
+
+    svc_ru     = ", ".join(_svc_label(s, "ru") for s in services)
+    price_ru   = _price_line(total_price, "ru")
+    price_part = f"\n{price_ru}" if price_ru else ""
+
+    # ── Barber walk-in → confirm immediately, no self-approval ────────────────
+    if is_barber_booking:
+        _finalize_confirmed(context.application, booking)
+        logger.info("Walk-in confirmed by barber: %s → %s (%d slots)",
+                    slot_key, name, n_slots)
+        overflow_part = (
+            f"\n\n⚠️ Выходит за рабочие часы на {overflow} мин!" if overflow > 0 else ""
+        )
+        await query.edit_message_text(
+            tx(uid, "client_booked", date=date_str, time=time_range, name=name,
+               phone=phone, svcs=svc_ru, mins=total_mins,
+               price=price_part, overflow=overflow_part),
+            parse_mode="HTML",
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # ── Regular client → enter pending, notify barber for approval ───────────
+    bid = _next_id()
+    pending_bookings[bid] = booking
     logger.info("Pending #%d: %s → %s (%d slots)", bid, slot_key, name, n_slots)
     customer_cache.setdefault(uid, {}).update(name=name, phone=phone)
-    _db_save_pending(bid, pending_bookings[bid])
+    _db_save_pending(bid, booking)
     _db_save_customer(uid)
-    _db_log_event("created", slot_key, uid, {"services": services, "duration_mins": total_mins})
     # _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
 
-    # Barber notification — always in Russian, with prices
-    svc_ru      = ", ".join(_svc_label(s, "ru") for s in services)
-    total_price = _calc_total_price(services)
-    price_ru    = _price_line(total_price, "ru")
-    price_part  = f"\n{price_ru}" if price_ru else ""
     overflow_warning = (
         f"\n\n⚠️ <b>Выходит за рабочие часы на {overflow} мин!</b>"
         if overflow > 0 else ""
@@ -2368,6 +2459,96 @@ async def on_stats_custom_text(update: Update, context: ContextTypes.DEFAULT_TYP
                                     reply_markup=_stats_keyboard("custom"))
 
 
+# ─────────────────────────── /broadcast — barber announcement ────────────────
+
+def _broadcast_recipients() -> list[int]:
+    """All customer user_ids except barber accounts."""
+    ids: list[int] = []
+    with sqlite3.connect(_DB_FILE) as conn:
+        for (uid,) in conn.execute("SELECT user_id FROM customers"):
+            if uid is not None and uid not in BARBER_CHAT_IDS:
+                ids.append(uid)
+    return ids
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_barber(update.effective_user.id):
+        await update.message.reply_text("Эта команда только для мастера.")
+        return
+
+    # Message text = everything after "/broadcast "
+    msg = ""
+    if context.args:
+        msg = update.message.text.split(None, 1)[1].strip() if update.message.text else ""
+    if not msg:
+        await update.message.reply_text(
+            "📢 <b>Рассылка клиентам</b>\n\n"
+            "Отправьте команду с текстом одним сообщением:\n"
+            "<code>/broadcast Ваш текст объявления…</code>\n\n"
+            "Перед отправкой покажу предпросмотр и спрошу подтверждение.",
+            parse_mode="HTML",
+        )
+        return
+
+    recipients = _broadcast_recipients()
+    context.user_data["broadcast_text"] = msg
+    preview = (
+        f"📢 <b>Предпросмотр рассылки</b>\n"
+        f"Получателей: <b>{len(recipients)}</b>\n"
+        f"────────────────\n\n{msg}\n\n"
+        f"────────────────\nОтправить?"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Отправить ({len(recipients)})", callback_data="bcast_send"),
+        InlineKeyboardButton("❌ Отмена", callback_data="bcast_cancel"),
+    ]])
+    await update.message.reply_text(preview, reply_markup=kb)
+
+
+async def cb_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_barber(update.effective_user.id):
+        await query.answer("Только для мастера.", show_alert=True)
+        return
+    await query.answer()
+
+    if query.data == "bcast_cancel":
+        context.user_data.pop("broadcast_text", None)
+        await query.edit_message_text("❌ Рассылка отменена.")
+        return
+
+    msg = context.user_data.pop("broadcast_text", None)
+    if not msg:
+        await query.edit_message_text("⚠️ Текст рассылки потерян, начните заново: /broadcast")
+        return
+
+    recipients = _broadcast_recipients()
+    await query.edit_message_text(f"📤 Отправляю… (0/{len(recipients)})")
+
+    sent = failed = 0
+    for i, uid in enumerate(recipients, 1):
+        try:
+            await context.bot.send_message(chat_id=uid, text=msg)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning("Broadcast to %s failed: %s", uid, exc)
+        # Telegram ~30 msg/s limit; small delay + progress every 25
+        await asyncio.sleep(0.05)
+        if i % 25 == 0:
+            try:
+                await query.edit_message_text(f"📤 Отправляю… ({i}/{len(recipients)})")
+            except Exception:
+                pass
+
+    await query.edit_message_text(
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"Доставлено: <b>{sent}</b>\n"
+        f"Не доставлено: <b>{failed}</b> (заблокировали бота / удалили чат)",
+        parse_mode="HTML",
+    )
+
+
 # ─────────────────────────── 30-min reminder job ─────────────────────────────
 
 async def _send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3064,6 +3245,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("bookings", "📋 Записи на сегодня"),
         BotCommand("week",     "🗓 Расписание на неделю"),
         BotCommand("stats",    "📊 Статистика"),
+        BotCommand("broadcast","📢 Рассылка клиентам"),
         BotCommand("config",   "⚙️ Рабочие часы"),
         BotCommand("mybooking","📋 Моя запись"),
         BotCommand("help",     "ℹ️ Помощь"),
@@ -3151,6 +3333,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("config",    cmd_config))
     app.add_handler(CommandHandler("stats",     cmd_stats))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("mybooking", cmd_mybooking))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("info",      cmd_info))
@@ -3183,6 +3366,8 @@ def build_application() -> Application:
                                           pattern=r"^noop$"))
     # /stats period picker (must come after ConversationHandler)
     app.add_handler(CallbackQueryHandler(cb_stats_period, pattern=r"^stats_p_"))
+    # /broadcast confirm / cancel
+    app.add_handler(CallbackQueryHandler(cb_broadcast, pattern=r"^bcast_(send|cancel)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
                                     on_stats_custom_text), group=1)
 
