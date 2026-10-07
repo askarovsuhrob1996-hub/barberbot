@@ -22,6 +22,7 @@ Customer commands:
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import logging.handlers
@@ -2514,14 +2515,18 @@ async def on_stats_custom_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─────────────────────────── /broadcast — barber announcement ────────────────
 
-def _broadcast_recipients() -> list[int]:
-    """All customer user_ids except barber accounts."""
-    ids: list[int] = []
+_BCAST_SEP = "|||"
+
+
+def _broadcast_recipients() -> dict[str, list[int]]:
+    """Customer user_ids grouped by language, barber accounts excluded."""
+    groups: dict[str, list[int]] = {"ru": [], "uz": []}
     with sqlite3.connect(_DB_FILE) as conn:
-        for (uid,) in conn.execute("SELECT user_id FROM customers"):
-            if uid is not None and uid not in BARBER_CHAT_IDS:
-                ids.append(uid)
-    return ids
+        for uid, lang in conn.execute("SELECT user_id, lang FROM customers"):
+            if uid is None or uid in BARBER_CHAT_IDS:
+                continue
+            groups["uz" if lang == "uz" else "ru"].append(uid)
+    return groups
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2538,24 +2543,54 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "📢 <b>Рассылка клиентам</b>\n\n"
             "Отправьте команду с текстом одним сообщением:\n"
             "<code>/broadcast Ваш текст объявления…</code>\n\n"
+            f"Чтобы узбекоязычные клиенты получили свой текст, разделите версии "
+            f"<code>{_BCAST_SEP}</code>:\n"
+            f"<code>/broadcast Русский текст {_BCAST_SEP} O'zbekcha matn</code>\n\n"
+            "Без разделителя всем уйдёт один текст.\n"
             "Перед отправкой покажу предпросмотр и спрошу подтверждение.",
             parse_mode="HTML",
         )
         return
 
-    recipients = _broadcast_recipients()
-    context.user_data["broadcast_text"] = msg
-    preview = (
-        f"📢 <b>Предпросмотр рассылки</b>\n"
-        f"Получателей: <b>{len(recipients)}</b>\n"
-        f"────────────────\n\n{msg}\n\n"
-        f"────────────────\nОтправить?"
-    )
+    ru_text, _, uz_text = msg.partition(_BCAST_SEP)
+    ru_text, uz_text = ru_text.strip(), uz_text.strip()
+    if not ru_text:
+        await update.message.reply_text(
+            f"⚠️ Перед «{_BCAST_SEP}» нет текста. Формат: "
+            f"русская версия, разделитель, узбекская."
+        )
+        return
+
+    # No uz version given → that group gets the ru text, same as before.
+    texts = {"ru": ru_text, "uz": uz_text or ru_text}
+    groups = _broadcast_recipients()
+    total = sum(len(ids) for ids in groups.values())
+    if not total:
+        await update.message.reply_text("📭 Пока некому отправлять — клиентов в базе нет.")
+        return
+
+    context.user_data["broadcast_texts"] = texts
+
+    # The barber's own text goes inside an HTML message, so it has to be escaped —
+    # an unlucky "<" or "&" in an announcement would otherwise break the preview.
+    lines = [f"📢 <b>Предпросмотр рассылки</b>\nПолучателей: <b>{total}</b>"]
+    for lang, title in (("ru", "🇷🇺 По-русски"), ("uz", "🇺🇿 O'zbekcha")):
+        if not groups[lang]:
+            continue
+        lines.append(
+            f"────────────────\n"
+            f"<b>{title}</b> — {len(groups[lang])} получ.\n\n"
+            f"{html.escape(texts[lang])}"
+        )
+    lines.append("────────────────\nОтправить?")
+
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"✅ Отправить ({len(recipients)})", callback_data="bcast_send"),
+        InlineKeyboardButton(f"✅ Отправить ({total})", callback_data="bcast_send"),
         InlineKeyboardButton("❌ Отмена", callback_data="bcast_cancel"),
     ]])
-    await update.message.reply_text(preview, reply_markup=kb)
+    await update.message.reply_text(
+        "\n\n".join(lines), parse_mode="HTML", reply_markup=kb,
+    )
 
 
 async def cb_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2566,20 +2601,21 @@ async def cb_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await query.answer()
 
     if query.data == "bcast_cancel":
-        context.user_data.pop("broadcast_text", None)
+        context.user_data.pop("broadcast_texts", None)
         await query.edit_message_text("❌ Рассылка отменена.")
         return
 
-    msg = context.user_data.pop("broadcast_text", None)
-    if not msg:
+    texts = context.user_data.pop("broadcast_texts", None)
+    if not texts:
         await query.edit_message_text("⚠️ Текст рассылки потерян, начните заново: /broadcast")
         return
 
-    recipients = _broadcast_recipients()
-    await query.edit_message_text(f"📤 Отправляю… (0/{len(recipients)})")
+    groups = _broadcast_recipients()
+    queue = [(uid, texts[lang]) for lang in ("ru", "uz") for uid in groups[lang]]
+    await query.edit_message_text(f"📤 Отправляю… (0/{len(queue)})")
 
     sent = failed = 0
-    for i, uid in enumerate(recipients, 1):
+    for i, (uid, msg) in enumerate(queue, 1):
         try:
             await context.bot.send_message(chat_id=uid, text=msg)
             sent += 1
@@ -2590,7 +2626,7 @@ async def cb_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await asyncio.sleep(0.05)
         if i % 25 == 0:
             try:
-                await query.edit_message_text(f"📤 Отправляю… ({i}/{len(recipients)})")
+                await query.edit_message_text(f"📤 Отправляю… ({i}/{len(queue)})")
             except Exception:
                 pass
 
