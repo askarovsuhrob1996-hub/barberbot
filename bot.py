@@ -408,8 +408,12 @@ STRINGS: dict[str, dict[str, str]] = {
         # ── status messages ────────────────────────────────────────────────────
         "waiting":              (
             "⏳ <b>Заявка отправлена мастеру!</b>\n\n"
-            "📅 {date}\n"
-            "🕐 {time}\n\n"
+            "  📅 Дата:          {date}\n"
+            "  🕐 Время:         {time}\n"
+            "  ⏱ Длительность:  ~{dur} мин.\n"
+            "  👤 Имя:           {name}\n"
+            "  📞 Телефон:       {phone}\n"
+            "  ✂️ Услуги:        {svcs}\n\n"
             "Как только мастер подтвердит — вы получите сообщение. "
             "Обычно это занимает несколько минут. 😊"
         ),
@@ -620,8 +624,12 @@ STRINGS: dict[str, dict[str, str]] = {
         # ── status messages ────────────────────────────────────────────────────
         "waiting":              (
             "⏳ <b>Ariza ustaga yuborildi!</b>\n\n"
-            "📅 {date}\n"
-            "🕐 {time}\n\n"
+            "  📅 Sana:         {date}\n"
+            "  🕐 Vaqt:         {time}\n"
+            "  ⏱ Davomiyligi:  ~{dur} daqiqa\n"
+            "  👤 Ism:          {name}\n"
+            "  📞 Telefon:      {phone}\n"
+            "  ✂️ Xizmat:       {svcs}\n\n"
             "Usta tasdiqlashi bilanoq sizga xabar beramiz. "
             "Odatda bu bir necha daqiqa oladi. 😊"
         ),
@@ -991,7 +999,9 @@ def _time_keyboard(for_date: date, lang: str,
     return InlineKeyboardMarkup(rows)
 
 
-def _services_keyboard(selected: set[str], lang: str) -> InlineKeyboardMarkup:
+def _services_keyboard(
+    selected: set[str], lang: str, is_barber: bool = False
+) -> InlineKeyboardMarkup:
     dur_unit = STRINGS[lang]["svc_dur_min"]
     rows = []
     for svc_id in SERVICES:
@@ -999,8 +1009,11 @@ def _services_keyboard(selected: set[str], lang: str) -> InlineKeyboardMarkup:
         mins = SERVICES[svc_id]["mins"]
         label = f"{tick}{_svc_client_label(svc_id, lang)}  ({mins} {dur_unit})"
         rows.append([InlineKeyboardButton(label, callback_data=svc_id)])
+    # Clients book straight from this screen — the button has to say so. Only the
+    # barber's walk-in flow still gets a separate confirmation screen after it.
+    done_label = STRINGS[lang]["btn_done" if is_barber else "btn_confirm"]
     rows.append([
-        InlineKeyboardButton(STRINGS[lang]["btn_done"],   callback_data="services_done"),
+        InlineKeyboardButton(done_label,                  callback_data="services_done"),
         InlineKeyboardButton(STRINGS[lang]["btn_cancel"], callback_data="cancel"),
     ])
     return InlineKeyboardMarkup(rows)
@@ -1010,6 +1023,19 @@ def _confirm_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(STRINGS[lang]["btn_confirm"], callback_data="confirm_yes"),
         InlineKeyboardButton(STRINGS[lang]["btn_cancel"],  callback_data="cancel"),
+    ]])
+
+
+def _pending_cancel_keyboard(uid: int, slot_key: str) -> InlineKeyboardMarkup:
+    """Undo button on the waiting screen of a freshly created pending booking.
+
+    Reschedule is deliberately absent: cb_user_reschedule only accepts confirmed
+    appointments, which is also why /mybooking shows pending bookings with a
+    cancel button alone.
+    """
+    enc = slot_key.replace(" ", "_", 1)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(tx(uid, "btn_cancel_booking"), callback_data=f"ucancel_{enc}"),
     ]])
 
 
@@ -1391,7 +1417,9 @@ async def _after_phone(
     )
     await update.message.reply_text(
         tx(uid, "select_svc"),
-        reply_markup=_services_keyboard(set(), lang),
+        reply_markup=_services_keyboard(
+            set(), lang, context.user_data.get("barber_booking", False)
+        ),
     )
     return STATE_SERVICES
 
@@ -1408,11 +1436,13 @@ async def cb_service_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if query.data == "cancel":
         return await _cancel_cb(update, context)
 
+    is_barber_booking = context.user_data.get("barber_booking", False)
+
     if query.data in SERVICES:
         selected.discard(query.data) if query.data in selected else selected.add(query.data)
         await query.edit_message_text(
             tx(uid, "select_svc"),
-            reply_markup=_services_keyboard(selected, lang),
+            reply_markup=_services_keyboard(selected, lang, is_barber_booking),
         )
         return STATE_SERVICES
 
@@ -1442,6 +1472,12 @@ async def cb_service_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["duration_mins"]  = total_mins
         context.user_data["time_range"]     = time_range
         context.user_data["overflow_mins"]  = overflow
+
+        # Clients have nothing left to review — everything on the old confirmation
+        # screen was typed by them two screens ago — so the booking is created
+        # right here and the summary moves into the waiting message.
+        if not is_barber_booking:
+            return await _submit_booking(update, context)
 
         svc_text = ", ".join(_svc_client_label(s, lang) for s in selected)
 
@@ -1488,15 +1524,28 @@ def _finalize_confirmed(app, booking: dict) -> None:
 
 
 async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Barber walk-in confirmation screen. Clients never reach this state."""
     query = update.callback_query
     await query.answer()
-    uid  = update.effective_user.id
-    lang = _lang(uid)
 
     if query.data == "cancel":
         return await _cancel_cb(update, context)
     if query.data != "confirm_yes":
         return STATE_CONFIRM
+
+    return await _submit_booking(update, context)
+
+
+async def _submit_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Create the booking from the collected user_data and end the flow.
+
+    Two callers, both of them callback handlers that already answered the query:
+    cb_service_toggle for clients (straight off the services screen) and
+    cb_confirm for the barber's walk-in flow.
+    """
+    query = update.callback_query
+    uid  = update.effective_user.id
+    lang = _lang(uid)
 
     d          = context.user_data["date"]
     t          = context.user_data["time"]
@@ -1593,7 +1642,10 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         }
         _db_save_pending(bid, pending_bookings[bid])
 
-    waiting_msg = tx(uid, "waiting", date=date_str, time=time_range)
+    waiting_msg = tx(uid, "waiting",
+                     date=date_str, time=time_range, dur=total_mins,
+                     name=name, phone=phone,
+                     svcs=", ".join(_svc_client_label(s, lang) for s in services))
     if overflow > 0:
         if lang == "uz":
             waiting_msg += (
@@ -1608,6 +1660,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.edit_message_text(
         waiting_msg,
         parse_mode="HTML",
+        reply_markup=_pending_cancel_keyboard(uid, slot_key),
     )
     context.user_data.clear()
     return ConversationHandler.END
