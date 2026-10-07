@@ -275,8 +275,13 @@ def _db_delete_blocked(slot_key: str) -> None:
 
 def _db_log_event(event: str, slot_key: str | None, user_id: int | None,
                   data: dict | None = None) -> None:
-    """Append a row to booking_log. Events: created, approved, rejected,
-    cancelled_barber, cancelled_user, timeout, rescheduled."""
+    """Append a row to booking_log.
+
+    Booking lifecycle: created, approved, rejected, cancelled_barber,
+    cancelled_user, timeout, rescheduled.
+    Booking flow (see _FUNNEL_STEPS): flow_started, date_picked, time_picked,
+    services_shown, plus flow_abandoned carrying the step in its data.
+    """
     try:
         with sqlite3.connect(_DB_FILE) as conn:
             conn.execute(
@@ -287,6 +292,33 @@ def _db_log_event(event: str, slot_key: str | None, user_id: int | None,
             )
     except Exception as exc:
         logger.error("DB log_event failed (%s %s): %s", event, slot_key, exc)
+
+
+# Booking-flow steps in order, from entering the flow to the request being sent.
+# "created" closes the funnel and is logged by _submit_booking.
+_FUNNEL_STEPS = ("flow_started", "date_picked", "time_picked", "services_shown")
+
+
+def _log_funnel(uid: int, step: str, slot_key: str | None = None,
+                data: dict | None = None) -> None:
+    """Record a client's progress through the booking flow.
+
+    Barber walk-ins run through the very same handlers but are not the funnel
+    we want to measure, so they are skipped — which also keeps the step counts
+    comparable with the "created" events the stats screen filters the same way.
+    """
+    if _is_barber(uid):
+        return
+    _db_log_event(step, slot_key, uid, data)
+
+
+def _flow_step(user_data: dict) -> str:
+    """Which screen the client was on, judged by what they already filled in."""
+    for key, step in (("phone", "services"), ("name", "phone"),
+                      ("time", "name"), ("date", "time")):
+        if key in user_data:
+            return step
+    return "date"
 
 
 # Short day labels for the config UI (Russian, barber-facing)
@@ -1086,6 +1118,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid  = update.effective_user.id
     name = update.effective_user.first_name
     logger.info("User %s (%d) /start", name, uid)
+    _log_funnel(uid, "flow_started")
 
     if "lang" not in customer_cache.get(uid, {}):
         cfg = schedule_config
@@ -1182,6 +1215,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     if context.user_data:
         # Inside an active booking flow — exit it
+        _log_funnel(uid, "flow_abandoned", data={"step": _flow_step(context.user_data)})
         context.user_data.clear()
         await update.message.reply_text(
             tx(uid, "flow_cancelled"),
@@ -1195,10 +1229,10 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def _cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    _log_funnel(uid, "flow_abandoned", data={"step": _flow_step(context.user_data)})
     context.user_data.clear()
-    await update.callback_query.edit_message_text(
-        tx(update.effective_user.id, "booking_cancel")
-    )
+    await update.callback_query.edit_message_text(tx(uid, "booking_cancel"))
     return ConversationHandler.END
 
 
@@ -1280,6 +1314,7 @@ async def cb_date_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return STATE_DATE
 
+    _log_funnel(uid, "date_picked", data={"date": chosen.isoformat()})
     await query.edit_message_text(
         tx(uid, "date_selected", date=_fmt_date(chosen, lang)),
         parse_mode="HTML",
@@ -1307,7 +1342,6 @@ async def cb_time_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     t        = query.data.split("_", 1)[1]      # "09:00"
     slot_key = f"{context.user_data['date'].isoformat()} {t}"
-    context.user_data["time"] = t
 
     if slot_key in _all_taken_slots():
         await query.edit_message_text(
@@ -1316,7 +1350,11 @@ async def cb_time_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return STATE_TIME
 
+    # Recorded only once the slot is actually free, so that a client who bounced
+    # off a taken slot is still counted as sitting on the time screen.
+    context.user_data["time"] = t
     context.user_data["services"] = set()
+    _log_funnel(uid, "time_picked", slot_key)
 
     # Barber booking a walk-in → always capture the real client's name/phone,
     # never reuse the barber's own cached identity.
@@ -1326,6 +1364,9 @@ async def cb_time_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     cached = customer_cache.get(uid, {})
     if not is_barber and "name" in cached and "phone" in cached:
         context.user_data.update(name=cached["name"], phone=cached["phone"])
+        # Returning client — name and phone come from the cache, so the services
+        # screen is reached in the same step.
+        _log_funnel(uid, "services_shown", slot_key)
         await query.edit_message_text(
             tx(uid, "welcome_back", time=t, name=cached["name"]),
             parse_mode="HTML",
@@ -1412,6 +1453,9 @@ async def _after_phone(
     uid  = update.effective_user.id
     lang = _lang(uid)
     context.user_data["phone"] = phone
+    d = context.user_data.get("date")
+    _log_funnel(uid, "services_shown",
+                f"{d.isoformat()} {context.user_data['time']}" if d else None)
     await update.message.reply_text(
         tx(uid, "phone_saved", phone=phone),
         reply_markup=ReplyKeyboardRemove(),
@@ -2278,19 +2322,20 @@ def _build_stats_text(start_d: date, end_d: date, period_label: str) -> str:
     today = datetime.now(tz=TZ).date()
 
     all_bookings: list[dict[str, Any]] = []
-    log_events: list[tuple[str, str, str | None, int | None]] = []
+    log_events: list[tuple[str, str, str | None, int | None, str | None]] = []
     with sqlite3.connect(_DB_FILE) as conn:
         for row in conn.execute("SELECT slot_key, data FROM bookings"):
             bk = json.loads(row[1])
             bk["_slot_key"] = row[0]
             all_bookings.append(bk)
         total_customers = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
-        for row in conn.execute("SELECT ts, event, slot_key, user_id FROM booking_log"):
-            log_events.append((row[0], row[1], row[2], row[3]))
+        for row in conn.execute(
+                "SELECT ts, event, slot_key, user_id, data FROM booking_log"):
+            log_events.append((row[0], row[1], row[2], row[3], row[4]))
 
     evt_counter: Counter = Counter()
     log_users_by_date: dict[str, set[int]] = {}
-    for ts, event, _sk, uid in log_events:
+    for ts, event, _sk, uid, _data in log_events:
         evt_counter[event] += 1
         if uid:
             try:
@@ -2403,6 +2448,48 @@ def _build_stats_text(start_d: date, end_d: date, period_label: str) -> str:
         and bk["_slot_key"] < (week_start + timedelta(days=7)).isoformat()
     )
 
+    # Booking-flow funnel for the selected period. Barber accounts are filtered
+    # out so every step — including "created" — counts the same population.
+    step_counter: Counter = Counter()
+    abandon_counter: Counter = Counter()
+    for ts, event, _sk, ev_uid, ev_data in log_events:
+        if ev_uid in BARBER_CHAT_IDS:
+            continue
+        if event not in _FUNNEL_STEPS and event not in ("created", "flow_abandoned"):
+            continue
+        try:
+            ev_date = datetime.fromisoformat(ts).date()
+        except (ValueError, TypeError):
+            continue
+        if not start_d <= ev_date <= end_d:
+            continue
+        step_counter[event] += 1
+        if event == "flow_abandoned" and ev_data:
+            try:
+                abandon_counter[json.loads(ev_data).get("step", "?")] += 1
+            except (ValueError, TypeError):
+                pass
+
+    flow_text = ""
+    started = step_counter.get("flow_started", 0)
+    if started:
+        rows = []
+        for ev, step_label in (("flow_started",   "Начали запись"),
+                               ("date_picked",    "Выбрали день"),
+                               ("time_picked",    "Выбрали время"),
+                               ("services_shown", "Дошли до услуг"),
+                               ("created",        "Отправили заявку")):
+            cnt = step_counter.get(ev, 0)
+            rows.append(f"  {step_label}: <b>{cnt}</b> ({round(cnt / started * 100)}%)")
+        if abandon_counter:
+            step_names = {"date": "дне", "time": "времени", "name": "имени",
+                          "phone": "телефоне", "services": "услугах"}
+            rows.append("  <i>Нажали «Отмена» на: " + ", ".join(
+                f"{step_names.get(s, s)} — {c}" for s, c in abandon_counter.most_common()
+            ) + "</i>")
+        flow_text = (f"\n🧭 <b>Путь к записи</b> (клиенты) — <i>{date_range}</i>\n"
+                     + "\n".join(rows) + "\n")
+
     funnel = ""
     if n_created > 0:
         approve_rate = round(n_approved / n_created * 100) if n_created else 0
@@ -2431,7 +2518,7 @@ def _build_stats_text(start_d: date, end_d: date, period_label: str) -> str:
         f"  Эта неделя: <b>{bookings_week}</b>\n"
         f"  Всего подтверждённых: <b>{len(all_bookings)}</b>\n"
         f"  Всего отменённых: <b>{n_cancelled_total}</b>\n"
-        f"{funnel}\n"
+        f"{flow_text}{funnel}\n"
         f"✂️ <b>Популярные услуги</b>\n{svc_text}\n\n"
         f"🕐 <b>Пиковые часы</b>\n  {peak_text}\n\n"
         f"📆 <b>Загрузка по дням</b>\n{wd_text}\n\n"
