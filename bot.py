@@ -1059,19 +1059,6 @@ def _confirm_keyboard(lang: str) -> InlineKeyboardMarkup:
     ]])
 
 
-def _pending_cancel_keyboard(uid: int, slot_key: str) -> InlineKeyboardMarkup:
-    """Undo button on the waiting screen of a freshly created pending booking.
-
-    Reschedule is deliberately absent: cb_user_reschedule only accepts confirmed
-    appointments, which is also why /mybooking shows pending bookings with a
-    cancel button alone.
-    """
-    enc = slot_key.replace(" ", "_", 1)
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(tx(uid, "btn_cancel_booking"), callback_data=f"ucancel_{enc}"),
-    ]])
-
-
 def _phone_keyboard(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -1667,16 +1654,7 @@ async def _submit_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     barber_msg = await _send_to_all_barbers(
         query.get_bot(),
-        text=(
-            f"🔔 <b>Новая заявка!</b>\n\n"
-            f"📅 {date_str}\n"
-            f"🕐 {time_range}\n"
-            f"👤 {name}\n"
-            f"📞 {phone}\n"
-            f"✂️ {svc_ru}\n"
-            f"⏱ ~{total_mins} мин.{price_part}"
-            f"{overflow_warning}"
-        ),
+        text=_barber_request_text(booking) + overflow_warning,
         parse_mode="HTML",
         reply_markup=_approval_keyboard(bid),
     )
@@ -1705,7 +1683,7 @@ async def _submit_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.edit_message_text(
         waiting_msg,
         parse_mode="HTML",
-        reply_markup=_pending_cancel_keyboard(uid, slot_key),
+        reply_markup=_mybooking_keyboard(uid, slot_key),
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -2964,20 +2942,15 @@ async def cmd_mybooking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for slot_key, bk, status in upcoming:
         enc = slot_key.replace(" ", "_", 1)
         suffix = f" · {_short_date(slot_key)} {slot_key.split()[1]}" if multi else ""
-        if status == "confirmed":
-            rows.append([
-                InlineKeyboardButton(tx(uid, "btn_reschedule") + suffix,
-                                     callback_data=f"uresch_{enc}"),
-            ])
-            rows.append([
-                InlineKeyboardButton(tx(uid, "btn_cancel_booking") + suffix,
-                                     callback_data=f"ucancel_{enc}"),
-            ])
-        else:
-            rows.append([
-                InlineKeyboardButton(tx(uid, "btn_cancel_booking") + suffix,
-                                     callback_data=f"ucancel_{enc}"),
-            ])
+        # Both confirmed and still-pending bookings can be moved.
+        rows.append([
+            InlineKeyboardButton(tx(uid, "btn_reschedule") + suffix,
+                                 callback_data=f"uresch_{enc}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(tx(uid, "btn_cancel_booking") + suffix,
+                                 callback_data=f"ucancel_{enc}"),
+        ])
 
     kb = InlineKeyboardMarkup(rows) if rows else None
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
@@ -3043,6 +3016,77 @@ def _mybooking_keyboard(uid: int, slot_key: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _find_user_booking(slot_key: str, uid: int) -> tuple[dict | None, int | None]:
+    """Locate a client's booking by slot — confirmed first, then awaiting approval.
+
+    Returns (booking, bid); bid is None for a confirmed booking and the pending
+    id otherwise, which is what tells the reschedule flow which path to take.
+    """
+    bk = appointments.get(slot_key)
+    if bk and bk.get("user_id") == uid:
+        return bk, None
+    for bid, pb in pending_bookings.items():
+        if pb["slot_key"] == slot_key and pb.get("user_id") == uid:
+            return pb, bid
+    return None, None
+
+
+def _barber_request_text(booking: dict, old_slot: str | None = None) -> str:
+    """Approval-request text for the barber; with old_slot it reads as a move."""
+    price_line = _price_line(booking.get("total_price", 0), "ru")
+    moved = ""
+    if old_slot:
+        moved = (f"\n❌ Было: {booking.get('rescheduled_from_date', old_slot.split()[0])}"
+                 f"  {booking.get('rescheduled_from_time', old_slot.split()[1])}")
+    return (
+        f"{'🔄 <b>Клиент перенёс заявку!</b>' if old_slot else '🔔 <b>Новая заявка!</b>'}\n\n"
+        f"📅 {booking['date_str']}\n"
+        f"🕐 {booking['time_range']}\n"
+        f"👤 {booking['name']}\n"
+        f"📞 {booking['phone']}\n"
+        f"✂️ {', '.join(_svc_label(s, 'ru') for s in booking.get('services', []))}\n"
+        f"⏱ ~{booking.get('duration_mins', 30)} мин."
+        f"{chr(10) + price_line if price_line else ''}"
+        f"{moved}"
+    )
+
+
+async def _refresh_barber_approval(bot_, bid: int, booking: dict, text: str) -> dict[str, int]:
+    """Rewrite the approval messages the barbers are already holding.
+
+    The pending id is kept across a reschedule on purpose: the approve/reject
+    buttons under the existing message stay valid, so a barber who never scrolls
+    back still acts on the current time instead of the one he was first sent.
+    Editing can fail on a deleted or very old message — then that barber gets a
+    fresh one, and the returned map replaces barber_msg_ids.
+    """
+    msg_ids: dict[str, int] = dict(booking.get("barber_msg_ids", {}))
+    if not msg_ids:
+        # Nobody has a message to edit (the original send failed) — start over.
+        sent = await _send_to_all_barbers(bot_, text=text, parse_mode="HTML",
+                                          reply_markup=_approval_keyboard(bid))
+        return {str(cid): m.message_id for cid, m in (sent or {}).items()}
+
+    for cid_str, msg_id in list(msg_ids.items()):
+        try:
+            await bot_.edit_message_text(
+                chat_id=int(cid_str), message_id=msg_id, text=text,
+                parse_mode="HTML", reply_markup=_approval_keyboard(bid),
+            )
+        except Exception as exc:
+            logger.warning("Reschedule: edit for barber %s failed (%s) — re-sending",
+                           cid_str, exc)
+            try:
+                m = await bot_.send_message(
+                    chat_id=int(cid_str), text=text, parse_mode="HTML",
+                    reply_markup=_approval_keyboard(bid),
+                )
+                msg_ids[cid_str] = m.message_id
+            except Exception as exc2:
+                logger.error("Reschedule: re-send for barber %s failed: %s", cid_str, exc2)
+    return msg_ids
+
+
 async def cb_user_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start reschedule flow: show new-date picker."""
     query = update.callback_query
@@ -3052,7 +3096,8 @@ async def cb_user_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
     encoded  = query.data[len("uresch_"):]
     slot_key = encoded.replace("_", " ", 1)
 
-    if slot_key not in appointments or appointments[slot_key].get("user_id") != uid:
+    booking, _bid = _find_user_booking(slot_key, uid)
+    if booking is None:
         await query.answer("Запись не найдена.", show_alert=True)
         return
 
@@ -3114,7 +3159,7 @@ async def cb_ur_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await query.answer("Сессия истекла. Попробуйте /mybooking.", show_alert=True)
         return
 
-    old_bk = appointments.get(old_slot)
+    old_bk, _bid = _find_user_booking(old_slot, uid)
     if not old_bk:
         await query.answer("Запись не найдена.", show_alert=True)
         return
@@ -3158,26 +3203,33 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text("Сессия истекла. Попробуйте /mybooking.")
         return
 
-    if old_slot not in appointments or appointments[old_slot].get("user_id") != uid:
+    old_bk, pending_bid = _find_user_booking(old_slot, uid)
+    if old_bk is None:
         await query.edit_message_text("Запись не найдена.")
         return
 
-    # Remove old confirmed booking
-    old_bk = appointments.pop(old_slot)
-    _db_delete_booking(old_slot)
-    _cancel_reminder(context.application, old_slot)
-    _cancel_barber_reminder(context.application, old_slot)
+    # Free the old slot first, so _can_fit does not count the booking being moved
+    # against itself. Both branches restore it untouched if the new slot is gone.
+    if pending_bid is None:
+        appointments.pop(old_slot)
+        _db_delete_booking(old_slot)
+        _cancel_reminder(context.application, old_slot)
+        _cancel_barber_reminder(context.application, old_slot)
+    else:
+        pending_bookings.pop(pending_bid)
 
-    # Verify the new slot is free (now that old is freed)
     new_slot   = f"{new_date.isoformat()} {new_time}"
     n_slots    = old_bk.get("duration_slots", 1)
 
     if not _can_fit(new_date, new_time, n_slots, allow_overflow=True):
-        # New slot taken — restore old booking and tell user to pick again
-        appointments[old_slot] = old_bk
-        _db_save_booking(old_slot, old_bk)
-        _schedule_reminder(context.application, old_bk)
-        _schedule_barber_reminder(context.application, old_bk)
+        # New slot taken — restore the booking and let the client pick again
+        if pending_bid is None:
+            appointments[old_slot] = old_bk
+            _db_save_booking(old_slot, old_bk)
+            _schedule_reminder(context.application, old_bk)
+            _schedule_barber_reminder(context.application, old_bk)
+        else:
+            pending_bookings[pending_bid] = old_bk
         context.user_data["reschedule_old_slot"] = old_slot
         context.user_data["reschedule_new_date"] = new_date
         kb = _time_keyboard(
@@ -3191,51 +3243,61 @@ async def cb_ur_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    overflow = _overflow_minutes(new_time, n_slots)
-
-    # Create new pending booking with updated slot
-    bid          = _next_id()
+    overflow     = _overflow_minutes(new_time, n_slots)
     new_date_str = _fmt_date(new_date, lang)
     new_tr       = _fmt_time_range(new_time, n_slots)
-    new_bk       = {
-        **old_bk,
-        "slot_key":         new_slot,
-        "date_str":         new_date_str,
-        "time":             new_time,
-        "time_range":       new_tr,
-        "booked_at":        datetime.now(tz=TZ).isoformat(),
-        "rescheduled_from": old_slot,
-        "user_lang":        lang,
-    }
-    pending_bookings[bid] = new_bk
-    _db_save_pending(bid, new_bk)
-    # _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
-
-    logger.info("Reschedule #%d: %s → %s (%s)", bid, old_slot, new_slot, old_bk["name"])
-    _db_log_event("rescheduled", old_slot, old_bk.get("user_id"), {"new_slot": new_slot})
-
     old_date_str = old_bk.get("date_str", old_slot.split()[0])
     old_time_str = old_bk.get("time_range", old_slot.split()[1])
-    svc_ru       = ", ".join(_svc_label(s, "ru") for s in old_bk["services"])
+
+    new_bk = {
+        **old_bk,
+        "slot_key":              new_slot,
+        "date_str":              new_date_str,
+        "time":                  new_time,
+        "time_range":            new_tr,
+        "booked_at":             datetime.now(tz=TZ).isoformat(),
+        "rescheduled_from":      old_slot,
+        "rescheduled_from_date": old_date_str,
+        "rescheduled_from_time": old_time_str,
+        "user_lang":             lang,
+    }
+
     overflow_warning = (
         f"\n\n⚠️ <b>Выходит за рабочие часы на {overflow} мин!</b>"
         if overflow > 0 else ""
     )
-    await _send_to_all_barbers(
-        query.get_bot(),
-        text=(
-            f"🔄 <b>Запрос на перенос!</b>\n\n"
-            f"👤 {old_bk['name']}\n"
-            f"📞 {old_bk['phone']}\n"
-            f"❌ Было:  {old_date_str}  {old_time_str}\n"
-            f"✅ Стало: {new_date_str}  {new_tr}\n"
-            f"✂️ {svc_ru}\n"
-            f"⏱ ~{old_bk.get('duration_mins', 30)} мин."
-            f"{overflow_warning}"
-        ),
-        parse_mode="HTML",
-        reply_markup=_approval_keyboard(bid),
-    )
+    barber_text = _barber_request_text(new_bk, old_slot) + overflow_warning
+
+    if pending_bid is None:
+        # Confirmed booking → a brand-new request the barber has not seen before
+        bid = _next_id()
+        pending_bookings[bid] = new_bk
+        sent = await _send_to_all_barbers(
+            query.get_bot(), text=barber_text, parse_mode="HTML",
+            reply_markup=_approval_keyboard(bid),
+        )
+        # Remembering the message ids lets cb_barber_decision mark the request
+        # resolved for every barber, not only the one who pressed the button.
+        new_bk["barber_msg_ids"] = {str(cid): m.message_id
+                                    for cid, m in (sent or {}).items()}
+    else:
+        # Still awaiting approval → move it in place under the same id and
+        # rewrite what the barbers are looking at.
+        bid = pending_bid
+        pending_bookings[bid] = new_bk
+        new_bk["barber_msg_ids"] = await _refresh_barber_approval(
+            query.get_bot(), bid, old_bk, barber_text,
+        )
+
+    _db_save_pending(bid, new_bk)
+    # _schedule_pending_timeout(context.application, bid, timedelta(minutes=30))
+
+    logger.info("Reschedule #%d (%s): %s → %s (%s)", bid,
+                "pending" if pending_bid is not None else "confirmed",
+                old_slot, new_slot, old_bk["name"])
+    _db_log_event("rescheduled", old_slot, old_bk.get("user_id"),
+                  {"new_slot": new_slot,
+                   "from": "pending" if pending_bid is not None else "confirmed"})
 
     await query.edit_message_text(
         tx(uid, "reschedule_waiting", date=new_date_str, time=new_tr),
@@ -3253,8 +3315,8 @@ async def cb_ur_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     context.user_data.pop("reschedule_new_date", None)
     context.user_data.pop("reschedule_new_time", None)
 
-    if old_slot and old_slot in appointments and appointments[old_slot].get("user_id") == uid:
-        bk       = appointments[old_slot]
+    bk, bid = _find_user_booking(old_slot, uid) if old_slot else (None, None)
+    if bk is not None:
         svc_text = ", ".join(_svc_client_label(s, lang) for s in bk["services"])
         dur_unit = STRINGS[lang]["svc_dur_min"]
         text = (
@@ -3263,7 +3325,7 @@ async def cb_ur_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"🕐 {bk.get('time_range', old_slot.split()[1])}\n"
             f"✂️ {svc_text}\n"
             f"⏱ ~{bk.get('duration_mins', 30)} {dur_unit}\n\n"
-            f"{tx(uid, 'mybooking_confirmed')}"
+            f"{tx(uid, 'mybooking_confirmed' if bid is None else 'mybooking_pending')}"
         )
         await query.edit_message_text(
             text, parse_mode="HTML",
